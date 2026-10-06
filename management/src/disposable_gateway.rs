@@ -719,6 +719,7 @@ async fn relay(
             .map(|ip| SocketAddr::new(*ip, port))
             .collect();
         let client = reqwest::Client::builder()
+            .user_agent("AgenticSandbox/1.0")
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&host, &sockets)
@@ -1028,6 +1029,7 @@ mod tests {
     async fn fixture_model_and_mcp_preserve_streams_methods_headers_and_queries() {
         let upstream=Router::new().route("/v1/chat/completions",post(|headers:HeaderMap,body:String|async move{
             assert_eq!(headers.get("authorization"),None);
+            assert_eq!(headers.get("user-agent").unwrap(),"AgenticSandbox/1.0");
             assert!(body.contains("tool_calls"));
             Response::builder().header("content-type","text/event-stream").body(Body::from("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"fixture\"}}]}}]}\n\ndata: [DONE]\n\n")).unwrap()
         })).route("/mcp",post(|headers:HeaderMap,OriginalUri(uri):OriginalUri|async move{

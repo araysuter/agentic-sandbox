@@ -2068,6 +2068,23 @@ async fn session_transcript_handler(
     }
 }
 
+/// Public dashboard shell only. Runtime data and actions still require operator auth.
+pub(crate) fn is_public_dashboard_asset(method: &axum::http::Method, path: &str) -> bool {
+    if !matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD) {
+        return false;
+    }
+    let asset = match path {
+        "/" => "index.html",
+        "/index.html" | "/app.js" | "/styles.css" | "/audit-styles.css" => &path[1..],
+        _ if path.starts_with("/modules/") || path.starts_with("/vendor/") => &path[1..],
+        _ => return false,
+    };
+    !asset
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+        && Assets::get(asset).is_some()
+}
+
 /// Serve static files from embedded assets
 async fn static_handler(uri: Uri) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');
@@ -2161,6 +2178,33 @@ mod tests {
             server.executor_surface.is_none(),
             "default HttpServer must not have an executor surface"
         );
+    }
+
+    #[test]
+    fn public_dashboard_assets_never_admit_runtime_routes() {
+        use axum::http::Method;
+        for path in [
+            "/",
+            "/index.html",
+            "/app.js",
+            "/styles.css",
+            "/modules/views/disposable.mjs",
+            "/vendor/xterm/xterm.min.js",
+        ] {
+            assert!(is_public_dashboard_asset(&Method::GET, path), "{path}");
+            assert!(is_public_dashboard_asset(&Method::HEAD, path), "{path}");
+            assert!(!is_public_dashboard_asset(&Method::POST, path), "{path}");
+        }
+        for path in [
+            "/api/v2/disposable-sessions",
+            "/api/v2/local-audits",
+            "/agents/foo",
+            "/modules/../app.js",
+            "/modules/missing.mjs",
+            "/test/local-audits-preview.html",
+        ] {
+            assert!(!is_public_dashboard_asset(&Method::GET, path), "{path}");
+        }
     }
 
     #[tokio::test]

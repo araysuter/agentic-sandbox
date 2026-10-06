@@ -400,7 +400,9 @@ pub async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if is_unauthenticated_metadata_path(req.uri().path()) {
+    if super::server::is_public_dashboard_asset(req.method(), req.uri().path())
+        || is_unauthenticated_metadata_path(req.uri().path())
+    {
         return next.run(req).await;
     }
 
