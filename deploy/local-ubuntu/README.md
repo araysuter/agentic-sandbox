@@ -8,7 +8,7 @@ No host Docker is needed. Run each stage deliberately:
 ```sh
 sudo bash deploy/local-ubuntu/host-packages.sh
 # Build as the ordinary user, not root.
-cargo build --release --manifest-path management/Cargo.toml --bin agentic-mgmt
+cargo build --locked --release --manifest-path management/Cargo.toml --bin agentic-mgmt
 sudo bash deploy/local-ubuntu/stage-release.sh "$PWD" \
   "$PWD/management/target/release/agentic-mgmt" RELEASE_ID
 sudo python3 /opt/agentic-sandbox/current/deploy/local-ubuntu/configure-service.py
