@@ -84,6 +84,10 @@ def clean_environment(config):
     path = os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')
     home = STATE / 'home'
     home.mkdir(exist_ok=True)
+    # Initialized once: subsequent user shell customizations stay intact.
+    bashrc = home / '.bashrc'
+    if not bashrc.exists():
+        bashrc.write_text("PS1='\\[\\e[32m\\]\\u@\\h:\\w\\[\\e[0m\\] \\$ '\n")
     return {'PATH': path, 'HOME': str(home), 'XDG_CONFIG_HOME': str(home / '.config'),
             'XDG_DATA_HOME': str(home / '.local/share'),
             'OPENCODE_CONFIG_CONTENT': json.dumps(config),
@@ -231,31 +235,16 @@ def audit(request, config):
 
 
 def interactive(request, config):
-    session_id = None
-    while deadline_seconds(request) > 1:
-        message = STATE / 'message.json'
-        if not message.exists():
-            time.sleep(0.5)
-            continue
-        consumed = STATE / 'message-consumed.json'
-        os.replace(message, consumed)
-        prompt = json.loads(consumed.read_text()).get('prompt')
-        consumed.unlink()
-        if not isinstance(prompt, str) or not prompt or len(prompt.encode()) > 65536:
-            continue
-        args = ['opencode', 'run', '--format', 'json', '--agent', 'sandbox']
-        if session_id:
-            args.extend(['--session', session_id])
-        args.append('Workspace is /workspace/source. ' + prompt)
-        config = opencode_config(request, json.loads((STATE / 'gateway.json').read_text()))
-        execute(args, STATE / 'events.jsonl', deadline_seconds(request), clean_environment(config), STATE)
-        try:
-            for line in (STATE / 'events.jsonl').read_text().splitlines():
-                event = json.loads(line)
-                session_id = event.get('sessionID', session_id)
-        except Exception:
-            pass
-    write_json(STATE / 'completion.json', {'state': 'completed'})
+    from terminal import run
+    code = run(request, config, STATE, SOURCE, clean_environment,
+               lambda gateway: opencode_config(request, gateway))
+    # Exiting OpenCode leaves the VM/workspace alive for until-deleted tasks.
+    # The host determines VM lifecycle independently of the browser terminal.
+    if request.get('lifetime') != 'until_deleted':
+        write_json(STATE / 'completion.json', {'state': 'completed' if code == 0 else 'failed'})
+    else:
+        while True:
+            time.sleep(60)
 
 
 def main():

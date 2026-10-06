@@ -4,12 +4,22 @@ Build, test, and development documentation for agentic-sandbox.
 
 ## Prerequisites
 
-- **Rust 1.75+** - [Install Rust](https://rustup.rs/)
+- **Current stable Rust** - [Install Rust](https://rustup.rs/); the locked dependency graph requires a recent toolchain.
 - **protobuf compiler** - `apt install protobuf-compiler` (Ubuntu) or `brew install protobuf` (macOS)
 - **QEMU/KVM** - For VM runtime (see [VM Prerequisites](images/qemu/README.md))
 - **libvirt** - VM management
 - **Docker Engine 24+** - For container runtime
 - **Python 3.11+** - For E2E tests
+
+## Ubuntu build dependencies
+
+```bash
+sudo apt-get install build-essential pkg-config libvirt-dev protobuf-compiler perl
+cargo build --locked --release --manifest-path management/Cargo.toml --bin agentic-mgmt
+```
+
+The executor uses its own tested JSON A2A adapter. This fork does not require
+credentials for the original maintainer's private A2A SDK mirror.
 
 ## Quick Start
 

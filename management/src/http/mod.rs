@@ -23,6 +23,7 @@ pub mod hitl;
 pub mod idempotency;
 pub mod loadout_registry;
 pub mod loadouts;
+pub mod local_audits;
 pub mod logs;
 pub mod mcp;
 pub mod operations;

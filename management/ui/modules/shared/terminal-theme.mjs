@@ -1,0 +1,23 @@
+/** Terminal-only ANSI palette; application chrome stays monochrome. */
+export const TERMINAL_THEME = Object.freeze({
+    background: '#000000',
+    foreground: '#f4f4f5',
+    cursor: '#ffffff',
+    selectionBackground: '#334155',
+    black: '#000000',
+    red: '#f87171',
+    green: '#4ade80',
+    yellow: '#facc15',
+    blue: '#60a5fa',
+    magenta: '#c084fc',
+    cyan: '#22d3ee',
+    white: '#e5e7eb',
+    brightBlack: '#64748b',
+    brightRed: '#fca5a5',
+    brightGreen: '#86efac',
+    brightYellow: '#fde047',
+    brightBlue: '#93c5fd',
+    brightMagenta: '#d8b4fe',
+    brightCyan: '#67e8f9',
+    brightWhite: '#ffffff',
+});

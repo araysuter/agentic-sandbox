@@ -115,8 +115,13 @@ def names(session):
     return "asd-" + suffix, "asdb" + suffix[:10], "asdt" + suffix[:10], "asd_" + suffix
 
 
-def network_settings():
-    host = ipaddress.IPv4Address(os.environ.get("DISPOSABLE_GATEWAY_IP", "192.0.2.1"))
+def network_settings(session=None):
+    slot = 0
+    if session is not None and (session / "request.json").exists():
+        slot = json.loads((session / "request.json").read_text()).get("network_slot", 0)
+    if type(slot) is not int or slot not in (0, 1, 2, 3):
+        raise ValueError("invalid isolated network slot")
+    host = ipaddress.IPv4Address(os.environ.get("DISPOSABLE_GATEWAY_IP", "192.0.2.1")) + 4 * slot
     network = ipaddress.IPv4Network(f"{host}/30", strict=False)
     if host != network.network_address + 1:
         raise ValueError("gateway must be first usable address in a dedicated /30")
@@ -128,7 +133,7 @@ def network_settings():
 
 def firewall_rules(session):
     _, bridge, tap, table = names(session)
-    host, guest_ip, _, port = network_settings()
+    host, guest_ip, _, port = network_settings(session)
     # bridge prerouting sees every Ethernet packet, before inet policy. ARP is
     # needed only to discover our gateway; no bridge ports lead to another LAN.
     return f'''table bridge {table} {{
@@ -393,13 +398,16 @@ def start(session):
         raise RuntimeError("session already provisioned; reconcile before retry")
     request = json.loads((session / "request.json").read_text())
     memory, cpus = request.get("memory_mb", 16384), request.get("vcpus", 6)
-    if not isinstance(memory, int) or not 1024 <= memory <= 32768 or not isinstance(cpus, int) or not 1 <= cpus <= 8:
-        raise ValueError("resource settings outside disposable profile bounds")
-    deadline = datetime.datetime.fromisoformat(request["deadline"].replace("Z", "+00:00"))
-    if deadline <= datetime.datetime.now(datetime.timezone.utc):
+    if type(memory) is not int or type(cpus) is not int or (memory, cpus) not in ((8192, 2), (12288, 4), (16384, 6)) or (request.get("kind") == "audit" and (memory, cpus) != (16384, 6)):
+        raise ValueError("choose Small (8 GiB / 2 vCPU), Medium (12 GiB / 4 vCPU), or Security (16 GiB / 6 vCPU)")
+    until_deleted = request.get("kind") == "interactive" and request.get("lifetime") == "until_deleted"
+    if request.get("deadline") is None and not until_deleted:
+        raise ValueError("deadline required for timed/audit sessions")
+    deadline = datetime.datetime.fromisoformat(request["deadline"].replace("Z", "+00:00")) if request.get("deadline") else None
+    if deadline is not None and deadline <= datetime.datetime.now(datetime.timezone.utc):
         raise ValueError("session deadline already passed")
     gateway = json.loads((session / "gateway.json").read_text())
-    host, guest_ip, network, port = network_settings()
+    host, guest_ip, network, port = network_settings(session)
     parsed = urllib.parse.urlsplit(gateway["url"])
     if parsed.scheme != "http" or parsed.hostname != host or parsed.port != port or parsed.username or parsed.password:
         raise ValueError("gateway must use dedicated bridge host and workload port")
@@ -415,7 +423,8 @@ def start(session):
                 "bridge": bridge, "network_policy": "default-deny", "gateway_port": port,
                 "provision_pid": os.getpid(), "provision_start_time": process_start_time(os.getpid())})
     try:
-        arm_watchdog(session, deadline)
+        if deadline is not None:
+            arm_watchdog(session, deadline)
         command(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b",
                  os.environ["DISPOSABLE_BASE_IMAGE"], str(runtime / "disk.qcow2"), "80G"])
         # No user credentials; guest control is via libvirt's private agent channel.
@@ -447,15 +456,24 @@ def start(session):
                 if time.monotonic() >= end:
                     raise RuntimeError("prepared baseline guest agent did not become ready")
                 time.sleep(1)
+        # Prepared means installed before this offline VM boots, never runtime
+        # package downloads. Verify the guest toolchain and its own Docker daemon.
+        tools = "import shutil; required=('opencode','docker','git','semgrep','gitleaks','trivy'); missing=[x for x in required if shutil.which(x) is None]; assert not missing, 'prepared baseline tools missing: '+','.join(missing)"
+        guest_exec(session, ["/usr/bin/python3", "-c", tools], timeout=15)
+        guest_exec(session, ["/usr/bin/systemctl", "start", "docker"], timeout=30)
+        guest_exec(session, ["/usr/bin/docker", "info", "--format", "{{.ServerVersion}}"], timeout=30)
         guest_exec(session, ["/usr/bin/mkdir", "-p", "/var/lib/disposable", "/workspace/source"])
         for name in ("request.json", "gateway.json"):
             guest_write(session, "/var/lib/disposable/" + name, session / name)
         guest_write(session, "/var/lib/disposable/run-audit.py", ROOT / "images/qemu/disposable/run-audit.py")
+        guest_write(session, "/var/lib/disposable/terminal.py", ROOT / "images/qemu/disposable/terminal.py")
         if source.exists():
             guest_write(session, "/var/lib/disposable/source.tar", source)
-        guest_exec(session, ["/usr/bin/systemd-run", "--unit=disposable-workload", "--collect",
-            "--property=RuntimeMaxSec=" + str(max(1, int((deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))),
-            "/usr/bin/python3", "/var/lib/disposable/run-audit.py"], timeout=30)
+        workload = ["/usr/bin/systemd-run", "--unit=disposable-workload", "--collect"]
+        if deadline is not None:
+            workload.append("--property=RuntimeMaxSec=" + str(max(1, int((deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))))
+        workload.extend(["/usr/bin/python3", "/var/lib/disposable/run-audit.py"])
+        guest_exec(session, workload, timeout=30)
         atomic_json(session / "runtime.json", {"state": "running", "domain": domain,
                     "bridge": bridge, "network_policy": "default-deny", "gateway_port": port})
     except Exception:

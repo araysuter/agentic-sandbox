@@ -1,17 +1,17 @@
 /** Disposable-session API contract. No credential values or arbitrary upstream URLs. */
 const ROOT = '/api/v2/disposable-sessions';
-export const TERMINAL_DISPOSABLE_STATES = new Set(['completed', 'failed', 'cancelled']);
+export const TERMINAL_DISPOSABLE_STATES = new Set(['completed', 'failed', 'cancelled', 'deleted']);
 export function disposableSegment(value) {
     if (typeof value !== 'string' || !value || value.length > 255) throw new TypeError('Invalid session identifier');
     return encodeURIComponent(value);
 }
-export function interactiveRequest({ memoryGb, vcpus, durationMinutes, modelId }) {
+export function interactiveRequest({ memoryGb, vcpus, durationMinutes, modelId, name, lifetime }) {
     const memory = Number(memoryGb), cpus = Number(vcpus), minutes = Number(durationMinutes);
-    if (memory !== 16) throw new TypeError('This profile requires 16 GB of guest memory');
-    if (cpus !== 6) throw new TypeError('This profile requires 6 shared vCPUs');
-    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 300) throw new TypeError('Duration must be 1–300 minutes');
+    if (!((memory === 8 && cpus === 2) || (memory === 12 && cpus === 4) || (memory === 16 && cpus === 6))) throw new TypeError('Choose Small (8 GiB, 2 vCPUs), Medium (12 GiB, 4 vCPUs), or Security (16 GiB, 6 vCPUs).');
+    if (name !== undefined && (!String(name).trim() || String(name).trim().length > 80)) throw new TypeError('Enter a workspace name of up to 80 characters.');
+    if (lifetime !== 'until_deleted' && (!Number.isInteger(minutes) || minutes < 1 || minutes > 300)) throw new TypeError('Duration must be 1–300 minutes');
     if (typeof modelId !== 'string' || !modelId || modelId.length > 255) throw new TypeError('Choose a host model preset');
-    return { kind: 'interactive', memory_mb: memory * 1024, vcpus: cpus, duration_seconds: minutes * 60, model_id: modelId };
+    return { kind: 'interactive', memory_mb: memory * 1024, vcpus: cpus, ...(lifetime === 'until_deleted' ? { lifetime: 'until_deleted' } : { duration_seconds: minutes * 60 }), model_id: modelId, ...(name === undefined ? {} : { name: String(name).trim() }) };
 }
 export function repositorySource(repository, commit, file) {
     if (!repository && !commit && !file) return {};
@@ -21,14 +21,14 @@ export function repositorySource(repository, commit, file) {
     return { repository, commit };
 }
 export function grantExpiry(minutes, deadline, now = Date.now()) {
-    const duration = Number(minutes), limit = Date.parse(deadline);
-    if (!Number.isInteger(duration) || duration < 1 || duration > 300 || !Number.isFinite(limit) || limit <= now) throw new TypeError('Choose an expiry within the active session deadline');
+    const duration = Number(minutes), limit = deadline == null ? Infinity : Date.parse(deadline);
+    if (!Number.isInteger(duration) || duration < 1 || duration > 300 || Number.isNaN(limit) || limit <= now) throw new TypeError('Choose an expiry within the active session deadline');
     return new Date(Math.min(now + duration * 60000, limit)).toISOString();
 }
 export function disposableErrorMessage(error) {
     if (error?.outcomeUnknown || error?.code === 'mutation_outcome_unknown') return 'Request outcome unknown. Refresh session state before retrying; the VM or permission may already exist.';
     const status = error?.status || error?.outcome?.status;
-    if (status === 409) return 'Busy: another session or audit owns the model, including cleanup. Refresh to inspect it; this request was not queued.';
+    if (status === 409) return 'VM capacity is unavailable or cleanup needs confirmation. Refresh to inspect running sessions; this request was not queued.';
     if ([401, 403].includes(status)) return 'Operator authentication is required for disposable session controls.';
     if ([404, 503].includes(status)) return 'Disposable KVM sessions are unavailable or not configured on this host.';
     if (error instanceof TypeError) return error.message;
@@ -61,5 +61,6 @@ export class DisposableClient {
     }
     message(id, prompt) { return this.call(`/${disposableSegment(id)}/messages`, 'POST', { prompt }); }
     report(id) { return this.call(`/${disposableSegment(id)}/report`); }
+    terminal(id, body) { return this.call(`/${disposableSegment(id)}/terminal`, 'POST', body); }
     output(id) { return this.call(`/${disposableSegment(id)}/output`); }
 }

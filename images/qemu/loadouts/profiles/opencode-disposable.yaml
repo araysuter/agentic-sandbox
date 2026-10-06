@@ -9,6 +9,13 @@ metadata:
 extends:
   - layers/base-dev.yaml
   - providers/opencode.yaml
+# Docker is rootful *inside the disposable guest*; its socket is never shared
+# with the host. Install scanners and cache dependencies when preparing the base.
+packages:
+  - docker.io
+  - qemu-guest-agent
+  - cloud-init
+  - git
 resources:
   cpus: 6
   memory: 16G

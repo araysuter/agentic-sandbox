@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 # Import the production modules directly, without the management workspace's
-# private A2A SDK dependency. This tests implementation, not copies or mocks.
+# full management dependency graph. This tests implementation, not copies or mocks.
 [workspace]
 
 [dependencies]

@@ -71,12 +71,21 @@ credential and release-provenance claims intentionally qualified by evidence.
 
 ## Disposable OpenCode and weekly audits
 
-The fork adds a disposable OpenCode session flow for a local model on a separate
-Studio, with 16 GiB / six shared vCPU KVM guests, temporary endpoint grants and
-per-repository weekly audit workflows. See [how the components work together](docs/disposable-sessions.md),
-[weekly audit integration](docs/weekly-security-audits.md), and
-[Ubuntu runtime acceptance](docs/disposable-runtime.md). The new profile requires
-explicit host configuration and KVM acceptance before operational use.
+The fork adds a simple dashboard with persistent OpenCode workspaces and a weekly
+repository-audit calendar. Small workspaces default to **8 GiB / two vCPUs**;
+Medium uses **12 GiB / four vCPUs**;
+audits use **16 GiB / six vCPUs**. The shared host limit is **32 GiB / eight vCPUs**.
+Use the real browser terminal, close it without stopping the VM, and explicitly
+delete the workspace when finished. Exa MCP is included; GitHub MCP uses an
+optional host-held PAT. The Mac Studio runs TensorFold and the model.
+
+Add a repository, host-saved GitHub token and weekly event to schedule an audit;
+no GitHub Actions workflow or runner is required. See
+[how the components work together](docs/disposable-sessions.md),
+[calendar and issue reporting](docs/weekly-security-audits.md),
+[API behavior](docs/disposable-api.md), and
+[Ubuntu acceptance](docs/disposable-runtime.md). Mac previews are fixtures; actual
+KVM/Studio acceptance and the complete management build remain required.
 
 ## Part of the AIWG Suite
 

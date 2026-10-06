@@ -1525,19 +1525,7 @@ class AgenticDashboard {
             scrollback: 0,
             fontSize: 13,
             fontFamily: "'SF Mono', 'Fira Code', 'Consolas', monospace",
-            theme: {
-                background: '#0d0d1a',
-                foreground: '#00ff88',
-                cursor: '#00ff88',
-                black: '#0d0d1a',
-                red: '#ff4444',
-                green: '#00ff88',
-                yellow: '#ffaa00',
-                blue: '#00d9ff',
-                magenta: '#7b2cbf',
-                cyan: '#00d9ff',
-                white: '#e8e8e8',
-            },
+            theme: { ...window.ManagementUI.TERMINAL_THEME },
         });
 
         // Fit addon — auto-resize terminal to container
@@ -4333,12 +4321,17 @@ class AgenticDashboard {
         this.disposableWorkspace = new window.ManagementUI.DisposableWorkspace({
             root: document, request: (path, options) => this.managementRequest(path, options),
         });
+        this.localAuditsWorkspace = new window.ManagementUI.LocalAuditsWorkspace({ root: document, request: (path, options) => this.managementRequest(path, options) });
         const requested = new URLSearchParams(window.location.search).get('workspace');
-        if (['fleet', 'celld', 'config', 'access', 'disposable'].includes(requested)) this.switchManagementWorkspace(requested);
+        this.switchManagementWorkspace(requested || 'audits');
     }
 
-    switchManagementWorkspace(workspace = 'console') {
-        const selected = ['fleet', 'celld', 'config', 'access', 'disposable'].includes(workspace) ? workspace : 'console';
+    switchManagementWorkspace(workspace = 'audits') {
+        const selected = ['fleet', 'celld', 'config', 'access', 'disposable', 'audits', 'audit-history', 'console'].includes(workspace) ? workspace : 'audits';
+        const audits = selected === 'audits' || selected === 'audit-history';
+        document.body.classList.toggle('workspace-audits', audits);
+        document.getElementById('audits-workspace')?.classList.toggle('hidden', !audits);
+        this.localAuditsWorkspace?.setActive(audits, selected === 'audit-history');
         document.body.classList.toggle('workspace-disposable', selected === 'disposable');
         document.getElementById('disposable-workspace')?.classList.toggle('hidden', selected !== 'disposable');
         this.disposableWorkspace?.setActive(selected === 'disposable');
@@ -4354,7 +4347,7 @@ class AgenticDashboard {
             button.classList.toggle('active', button.dataset.workspace === selected);
         });
         const url = new URL(window.location.href);
-        if (selected === 'console') url.searchParams.delete('workspace');
+        if (selected === 'audits') url.searchParams.delete('workspace');
         else url.searchParams.set('workspace', selected);
         history.replaceState(null, '', url);
         if (selected === 'fleet') this.fetchFleetInventory();

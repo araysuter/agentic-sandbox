@@ -70,6 +70,8 @@ pages=(
     test/contract-boundary.test.html
     test/api-client.test.html
     test/disposable-sessions.test.html
+    test/local-audits.test.html
+    test/interactive-workspace.test.html
     test/tui-redraw-stress.test.html
 )
 for page in "${pages[@]}"; do

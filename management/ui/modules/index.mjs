@@ -10,3 +10,6 @@ export * from './views/status.mjs';
 export * from './views/operations.mjs';
 export * from './domains/disposable.mjs';
 export * from './views/disposable.mjs';
+export * from './domains/local-audits.mjs';
+export * from './views/local-audits.mjs';
+export * from './shared/terminal-theme.mjs';

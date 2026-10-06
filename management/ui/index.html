@@ -4,8 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws: wss: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'">
-    <title>Agentic Sandbox Control Plane</title>
+    <title>Agentic Sandbox</title>
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="audit-styles.css">
     <link rel="stylesheet" href="vendor/xterm/xterm.min.css">
 </head>
 <body>
@@ -23,12 +24,16 @@
         <div class="header-content">
             <h1>Agentic Sandbox</h1>
             <nav class="workspace-nav" aria-label="Management workspace">
-                <button type="button" data-workspace="console" class="active">Console</button>
-                <button type="button" data-workspace="disposable">OpenCode VMs</button>
-                <button type="button" data-workspace="fleet">Fleet</button>
-                <button type="button" data-workspace="celld">Celld</button>
-                <button type="button" data-workspace="config">Config</button>
-                <button type="button" data-workspace="access">Access</button>
+                <button type="button" data-workspace="audits" class="active"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>Weekly audits</button>
+                <button type="button" data-workspace="audit-history"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 10a9 9 0 1 1 1 7M3 5v5h5M12 7v5l3 2"/></svg>Run history</button>
+                <button type="button" data-workspace="disposable"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H8l-5 3V5a2 2 0 0 1 2-2Z"/></svg>Interactive sessions</button>
+                <details class="workspace-more"><summary>More</summary>
+                    <button type="button" data-workspace="console">Console</button>
+                    <button type="button" data-workspace="fleet">Fleet</button>
+                    <button type="button" data-workspace="celld">Celld</button>
+                    <button type="button" data-workspace="config">Configuration</button>
+                    <button type="button" data-workspace="access">Access</button>
+                </details>
             </nav>
             <div class="header-right">
                 <span id="vm-count" class="header-stat">0 instances</span>
@@ -97,38 +102,65 @@
         </div>
 
         <main id="pane-container">
+<section id="audits-workspace" class="management-workspace hidden" aria-labelledby="audit-title">
+  <div class="audit-page-header"><div><h2 id="audit-title">Weekly audits</h2><p id="audit-subtitle">A quiet night for each repository.</p></div><button id="audit-add" class="audit-btn audit-primary" type="button" disabled><span aria-hidden="true">＋</span> Add repository</button></div>
+  <div id="audit-status" class="audit-status" role="status" aria-live="polite" hidden></div>
+  <div id="audit-calendar-view">
+    <div class="audit-toolbar"><span id="audit-zone">America/Detroit · Repeats every week</span><button id="audit-refresh" type="button" class="audit-btn audit-quiet">Refresh</button></div>
+    <div class="audit-calendar-scroll"><div id="audit-calendar" class="audit-calendar" aria-label="Recurring weekly audit calendar"></div></div>
+    <div class="audit-repositories audit-panel"><h3>Repositories</h3><div class="audit-repo-head"><span>Repository</span><span>Next run</span><span>Status</span><span></span></div><div id="audit-repositories"></div><div id="audit-empty" class="audit-empty">Add your first repository to reserve a weekly audit window.</div></div>
+    <p class="audit-footnote">If the model is busy, the run fails immediately. No queue.</p>
+  </div>
+  <div id="audit-history-view" hidden><div class="audit-panel"><div class="audit-history-heading"><h3>Recent runs</h3><p>Up to five new GitHub issues per repository each week.</p></div><div id="audit-history"></div></div></div>
+  <details class="audit-connection"><summary>Connection settings</summary><form id="audit-auth-form"><label for="audit-operator-token">Operator token</label><div class="audit-auth-row"><input id="audit-operator-token" type="password" autocomplete="off" maxlength="4096"><button class="audit-btn" type="submit">Connect</button><button class="audit-btn" id="audit-disconnect" type="button">Clear</button></div><small>Optional with authenticated host access. This token stays in this tab’s memory until cleared or reloaded.</small></form><p>Each audit runs in a disposable VM with 16 GiB memory and 6 shared vCPUs. TensorFold and its model stay on the Studio. Enable local audits and configure the host model preset before adding a schedule.</p></details>
+</section>
+
             <section id="disposable-workspace" class="management-workspace hidden" aria-labelledby="disposable-title">
                 <header class="workspace-header">
-                    <div><h2 id="disposable-title">Disposable OpenCode VMs</h2><p>One isolated session at a time. Tools run in Ubuntu; inference runs on the Studio.</p></div>
+                    <div><h2 id="disposable-title">Interactive sessions</h2><p>Your own workspace, ready for OpenCode and Docker.</p></div>
                     <button id="disposable-refresh" type="button" class="btn">Refresh sessions</button>
                 </header>
-                <form id="disposable-auth-form" class="disposable-auth-form">
+                <details class="interactive-connection"><summary>Connection settings</summary><form id="disposable-auth-form" class="disposable-auth-form">
                     <label>Operator bearer token (optional with authenticated mTLS)<input id="disposable-operator-token" type="password" maxlength="4096" autocomplete="off" spellcheck="false"></label>
                     <button type="submit" class="btn">Connect operator</button>
                     <button id="disposable-disconnect" type="button" class="btn">Clear operator token</button>
                     <small>The token stays in this tab's memory until cleared or reloaded. It is never sent to the guest or upstream endpoints.</small>
                 </form>
+                </details>
                 <div id="disposable-status" class="workspace-status" role="status" aria-live="polite">Host readiness has not been checked.</div>
                 <div class="disposable-grid">
+                    <div class="interactive-left">
                     <form id="disposable-create-form" class="review-panel">
-                        <h3>Create interactive session</h3>
-                        <p>A fresh workspace and OpenCode home are created in the VM. Host folders and credentials are not mounted.</p>
+                        <h3>Start a workspace</h3>
+                        <p>Choose a size and give your VM a name.</p>
+                        <label for="disposable-name">Workspace name</label><input id="disposable-name" maxlength="80" placeholder="e.g. API cleanup" value="My workspace">
+                        <label for="disposable-size">VM size</label><select id="disposable-size"><option value="small" selected>Small · 8 GiB memory · 2 vCPUs</option><option value="medium">Medium · 12 GiB memory · 4 vCPUs</option><option value="security">Security · 16 GiB memory · 6 vCPUs</option></select>
+                        <p class="interactive-baseline">OpenCode + Docker · Keeps running until you delete it</p>
+                        <label for="disposable-github-token">GitHub token <span class="audit-muted">(optional)</span></label><input id="disposable-github-token" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false"><p class="interactive-note">Stored only on the host. Enables GitHub tools with your token’s permissions.</p>
+                        <p id="disposable-mcp-summary" class="interactive-note">Exa search is included. GitHub tools connect when you add a token.</p>
+                        <details class="interactive-advanced"><summary>Advanced setup</summary>
                         <label for="disposable-model">Host model preset</label><select id="disposable-model" required disabled><option value="">Loading presets…</option></select>
                         <div class="disposable-fields">
-                            <label>Memory (GB)<input id="disposable-memory" type="number" min="16" max="16" step="1" value="16" readonly required></label>
-                            <label>Shared vCPUs<input id="disposable-cpus" type="number" min="6" max="6" value="6" readonly required></label>
-                            <label>Duration (minutes)<input id="disposable-duration" type="number" min="1" max="300" value="60" required></label>
+                            <label>Memory (GiB)<input id="disposable-memory" type="number" min="8" max="16" step="4" value="8" readonly required></label>
+                            <label>Shared vCPUs<input id="disposable-cpus" type="number" min="2" max="6" step="2" value="2" readonly required></label>
+                            <input id="disposable-duration" type="hidden" value="60">
                         </div>
                         <label>Repository (optional, owner/name)<input id="disposable-repository" maxlength="201" placeholder="owner/repo"></label>
                         <label>Pinned commit (required with repository)<input id="disposable-commit" maxlength="40" placeholder="40-character Git commit SHA" spellcheck="false"></label>
                         <label>Prepared repository snapshot (uncompressed .tar, at most 100 MiB)<input id="disposable-source-file" type="file" accept=".tar,application/x-tar"></label>
-                        <p id="disposable-source-help">For a repository session, provide the exact commit and its prepared data-only tar snapshot. The host validates archive paths before transfer; repository code runs only in the guest. Leave these fields empty for a fresh /workspace. Scheduled audits use the per-repo workflow.</p>
-                        <button id="disposable-create" type="submit" class="btn btn-primary" disabled>Create disposable VM</button>
-                        <p>Admission fails when another interactive session or audit owns the model. Ownership lasts through collection and cleanup.</p>
+                        <p id="disposable-source-help">For a repository session, provide the exact commit and its prepared data-only tar snapshot. The host validates archive paths before transfer; repository code runs only in the guest. Leave these fields empty for a fresh /workspace. Schedule recurring audits in Weekly audits.</p>
+                        </details>
+                        <button id="disposable-create" type="submit" class="btn btn-primary" disabled>Start VM</button>
+                        <p class="interactive-note">VMs share 32 GiB memory and 8 vCPUs. If capacity is full, the request fails immediately.</p>
                     </form>
                     <section class="review-panel" aria-labelledby="disposable-sessions-title"><h3 id="disposable-sessions-title">Sessions</h3><div id="disposable-list" class="workspace-list"><p>No session inventory loaded.</p></div></section>
+                    </div>
                     <section class="review-panel disposable-wide" aria-labelledby="disposable-detail-title">
-                        <h3 id="disposable-detail-title">Session state and permissions</h3>
+                        <div class="interactive-terminal-heading"><div><h3 id="disposable-detail-title">Workspace terminal</h3><p id="disposable-selected-summary">Select a workspace to open its terminal.</p></div><button id="disposable-terminal-restart" class="btn" type="button" hidden>Restart OpenCode</button><button id="disposable-terminal-reconnect" class="btn" type="button" disabled>Reconnect</button></div>
+                        <div id="disposable-terminal-status" class="interactive-terminal-status" role="status">No workspace selected.</div>
+                        <div id="disposable-terminal" class="interactive-terminal" role="region" aria-label="Workspace terminal" tabindex="0"></div>
+                        <p class="interactive-note">Closing this tab leaves your work running. Select this named workspace to return later. Press Ctrl+Shift+M to leave the terminal.</p>
+                        <details class="interactive-advanced"><summary>Workspace details and permissions</summary>
                         <div id="disposable-detail" class="workspace-detail"><p>Select a session.</p></div>
                         <div class="workspace-actions">
                             <button id="disposable-cancel" type="button" class="btn" disabled>Cancel and clean up</button>
@@ -150,6 +182,8 @@
                         </form>
                         <details><summary>OpenCode event output</summary><pre id="disposable-output">No selected output.</pre></details>
                         <details><summary>Audit report and coverage</summary><pre id="disposable-report">No audit report selected.</pre></details>
+                        </details>
+                        <button id="disposable-delete-workspace" class="btn interactive-delete" type="button" disabled>Delete workspace</button>
                     </section>
                 </div>
             </section>
@@ -842,6 +876,23 @@
             </div>
         </form>
     </dialog>
+
+<dialog id="disposable-delete-dialog" class="audit-dialog" aria-labelledby="disposable-delete-title"><h2 id="disposable-delete-title">Delete workspace?</h2><p id="disposable-delete-description">This stops the VM and permanently discards all its files and work. Nothing is exported.</p><div class="audit-dialog-actions"><button id="disposable-delete-back" class="audit-btn" type="button">Keep workspace</button><button id="disposable-delete-confirm" class="audit-btn audit-danger" type="button">Delete workspace</button></div></dialog>
+<dialog id="audit-dialog" class="audit-dialog" aria-labelledby="audit-dialog-title">
+<form id="audit-form" autocomplete="off">
+  <div class="audit-dialog-heading"><h2 id="audit-dialog-title">Add repository</h2><button id="audit-close" type="button" class="audit-icon-btn" aria-label="Close dialog">×</button></div>
+  <p class="audit-dialog-subtitle">Choose a repository and its weekly audit window.</p>
+  <label for="audit-repository">GitHub repository</label><input id="audit-repository" placeholder="owner/repository" required maxlength="201" spellcheck="false">
+  <label for="audit-token">Fine-grained GitHub token</label><input id="audit-token" type="password" autocomplete="new-password" required maxlength="4096" spellcheck="false"><small>Stored only on this host. Never sent to the VM or model.</small>
+  <h3>Weekly schedule</h3><label for="audit-weekday">Day</label><select id="audit-weekday"><option value="0">Monday</option><option value="1">Tuesday</option><option value="2">Wednesday</option><option value="3">Thursday</option><option value="4">Friday</option><option value="5">Saturday</option><option value="6">Sunday</option></select>
+  <div class="audit-time-fields"><div><label for="audit-start">Start</label><input id="audit-start" type="time" required value="01:00"></div><div><label for="audit-end">End</label><input id="audit-end" type="time" required value="06:00"></div></div>
+  <label for="audit-timezone">Time zone</label><input id="audit-timezone" required value="America/Detroit" maxlength="100"><small>A separate night is suggested for each repository. Choose 10 minutes to five hours.</small>
+  <label class="audit-checkbox"><input id="audit-publish" type="checkbox">Create GitHub issues</label><small>At most five new issues per repository each week. Leave off to review reports only.</small>
+  <details class="audit-advanced"><summary>Advanced</summary><label for="audit-model">Host model preset</label><input id="audit-model" required value="studio" maxlength="255"><label for="audit-ref">Branch or ref</label><input id="audit-ref" placeholder="Repository default branch" maxlength="255"><small>The host resolves this ref to a pinned commit when the audit starts. The GitHub token needs Contents: read and, for publishing, Issues: read and write on this repository.</small></details>
+  <p id="audit-form-error" class="audit-form-error" role="alert"></p>
+  <div class="audit-dialog-actions"><button id="audit-cancel" class="audit-btn" type="button">Cancel</button><button id="audit-save" class="audit-btn audit-primary" type="submit">Save schedule</button></div>
+</form></dialog>
+<dialog id="audit-report-dialog" class="audit-dialog audit-report-dialog" aria-labelledby="audit-report-title"><div class="audit-dialog-heading"><h2 id="audit-report-title">Audit report</h2><button id="audit-report-close" type="button" class="audit-icon-btn" aria-label="Close report">×</button></div><div id="audit-report-body"></div></dialog>
 
     <!-- Toast notifications -->
     <div id="toast-container" role="status" aria-live="polite" aria-atomic="false"></div>

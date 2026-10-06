@@ -214,5 +214,6 @@ test-disposable: ## Run portable disposable-session policy, runtime, reporting a
 	@cargo test --locked --manifest-path tests/disposable-rust/Cargo.toml
 	@python3 -m unittest discover -s scripts/security-audit -v
 	@python3 scripts/test-disposable-runtime.py
+	@python3 scripts/test-disposable-terminal.py
 	@bash -n scripts/disposable-vm.sh
 	@node --test --test-concurrency=$(NODE_TEST_CONCURRENCY) management/ui/test/management-ui.test.mjs

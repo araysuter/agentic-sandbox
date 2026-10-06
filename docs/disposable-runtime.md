@@ -1,123 +1,102 @@
-# Disposable Ubuntu runtime
+# Ubuntu VM runtime
 
-The new profile uses **16 GiB RAM, six shared vCPUs and an 80 GiB writable disk**.
-The Studio serves TensorFold/model inference. This guest runs OpenCode, its broad
-shell/root tools, guest Docker, scanners and tests. There is no GPU passthrough,
-host checkout/home sharing, agentshare, host Docker socket, SSH host key or
-GitHub token in the guest. Existing persistent VM profiles keep their behavior.
+The runtime boots Small **8 GiB / two shared vCPU**, Medium **12 GiB / four shared vCPU**
+workspaces or Security
+**16 GiB / six shared vCPU** audits. Each gets an 80 GiB writable qcow2 overlay
+on the same prepared Ubuntu base image. TensorFold/model inference stays on the
+Mac Studio. Guests have OpenCode, broad shell/root tools, their own Docker daemon,
+scanners and tests; no GPU passthrough, host home/project mounts, shared host
+Docker/libvirt sockets or host SSH credentials.
 
-## How the runtime fits the controller
+## Controller, guest and cleanup
 
-The Rust disposable-session controller owns admission, the absolute deadline,
-endpoint grants and cleanup reconciliation. Its configured runtime command is
-`scripts/disposable-vm.sh`. The trusted Linux host service needs permission to
-manage libvirt, bridges and nftables; do not grant audited repository code those
-permissions. Only controller-generated UUID directories directly beneath
-`DISPOSABLE_STATE_ROOT` are accepted. Keep the entry point, Python helper,
-baseline and state root administrator-owned. Never point this runtime at an
-untrusted checkout's script.
+The Rust controller owns resource admission, lifecycle and endpoint grants.
+`scripts/disposable-vm.sh` invokes the trusted host Python helper for libvirt,
+bridges and nftables. Only controller UUID directories beneath its state root
+are accepted. Never use runtime scripts or a base image supplied by an audited
+repository.
 
-`start` creates a new qcow2 overlay and cloud-init seed over an immutable prepared
-Ubuntu baseline. Before creating a disk or booting, it arms a root-owned host systemd timer for
-the absolute UTC deadline. Every cleanup path uses a Linux pidfd plus recorded start-time to kill an
-interrupted provisioner and wait for its exit before querying libvirt. This
-avoids PID-reuse signaling and restart/provisioning races. Its callback retries confirmed VM containment/cleanup even if the
-management process has died. Failed cleanup restarts under systemd until it
-succeeds; it does not release a false-success gate. It installs host bridge/nft policy **before boot**, defines a
-KVM domain, waits for qemu-guest-agent and transfers bounded source/config files
-through that guest control channel. No general filesystem mounts or SSH service
-are used. The source archive has no `.git` credentials and is extracted only in
-the guest. `status` reports actual harness completion; an OpenCode zero exit code
-alone does not establish that its security report is complete. `collect` reads
-only the fixed report name, with a 2 MiB bound. Host publication validates and
-redacts that report separately.
+Before boot, the runtime installs the host network policy. **Timed workspaces and
+audits** also arm an independent root-owned systemd watchdog for their absolute
+UTC deadline; timer failure rejects startup. **Keep until deleted** interactive
+VMs have no automatic deadline/watchdog. The runtime creates a fresh overlay and
+cloud-init seed, waits for qemu-guest-agent, and transfers bounded source/config
+through that control channel. No general filesystem share or SSH service is used.
+Boot readiness requires OpenCode and scanner binaries plus a functioning guest
+Docker daemon; a booted kernel alone is not reported ready.
 
-Interactive prompts use `message`: the controller writes a bounded prompt file,
-then the runtime transfers it atomically. The guest invokes one primary
-OpenCode agent and continues the saved session. `logs` collects its bounded JSON
-event transcript. Events and findings are separate formats. `grants` refreshes
-the guest endpoint configuration for the next prompt; gateway revoke/expiry
-terminates current streams independently. A newly added MCP is available on the
-next prompt. Audit processes do not automatically reload newly added MCP config.
+Interactive OpenCode runs on a real guest PTY. A guest HTTP console agent relays
+bounded terminal output and input through the host gateway; the administrator
+browser receives authenticated SSE. Detaching the browser preserves the guest
+processes. Terminal restart launches OpenCode again inside the same VM. The
+legacy HTTP `POST /messages` path sends bracketed-paste input through this console
+rather than uploading a prompt file and invoking a separate agent.
 
-`stop` first queries libvirt successfully and confirms destruction. A daemon
-query error is a cleanup failure, never proof that the guest disappeared. It
-then removes this run's VM definition, bridge, nft tables, disk, seed and guest
-state. It removes source and workload capability staging files; only explicitly
-collected reports/transcripts and controller metadata remain. Errors are visible
-and ownership stays held until the controller can reconcile them.
+Exa MCP is granted by default. An optional creation-time GitHub PAT enables
+GitHub MCP through host-only credential injection. Grants refresh the guest
+configuration; **restart the OpenCode TUI to load changed endpoint configuration**.
+An audit does not reload grants while executing. Gateway revocation takes effect
+immediately, including active streams, independently of TUI configuration. It
+cannot retract requests already delivered to an upstream service.
 
-## Enforced network boundary
+Cleanup quiesces an interrupted provisioner using a Linux pidfd and recorded
+process start-time before querying libvirt. A libvirt query failure is a cleanup
+failure, never evidence that a VM vanished. After confirmed destruction it removes
+the definition, bridge, nft tables, overlay, seed and staging files. Interactive
+deletion additionally purges terminal/workspace/output/credential content, retaining
+only bounded metadata. The base image remains. Audit reports are separately
+bounded and retained for host validation; guest success alone cannot bypass
+cleanup or establish complete coverage. Failed cleanup retries and blocks new
+admissions until containment is confirmed.
 
-Each admitted run gets a dedicated bridge: host `192.0.2.1`, guest `192.0.2.2`,
-`/30` by default. There is no DHCP/DNS/NAT forwarding. Host nft bridge prerouting
-allows ARP and only guest IPv4 TCP to the **distinct workload gateway port 8123**;
-other frames including IPv6 are dropped. Host inet input/forward chains deny
-other host services, routing and return forwarding on that bridge. Guest root
-can flush its own firewall, but cannot alter these host tables. An existing host
-firewall may additionally reject the allowed gateway; that fails closed.
+## Host-enforced network boundary
 
-The gateway separately authenticates the guest capability and enforces approved
-URL/grant scope, DNS pinning, redirect rejection, upstream credential delivery
-and stream revocation. Network filtering is not the URL policy. No raw upstream
-model/MCP secrets are written to cloud-init or argv. The scoped workload token
-is delivered over the guest-agent channel; it grants only approved endpoints for
-this session and expires at the controller deadline. Upstream model/MCP access
-requires the gateway, including explicit grants for private Studio endpoints.
-The management API remains separate from the workload port.
+Four network slots use separate /30 bridges by default:
 
-## Baseline and host configuration
+| Slot | Host gateway | Guest |
+| --- | --- | --- |
+| 0 | 192.0.2.1 | 192.0.2.2 |
+| 1 | 192.0.2.5 | 192.0.2.6 |
+| 2 | 192.0.2.9 | 192.0.2.10 |
+| 3 | 192.0.2.13 | 192.0.2.14 |
 
-Set `DISPOSABLE_BASE_IMAGE` to an absolute, standalone, root-owned qcow2 with no
-writable group/world permissions. It must be readable by `libvirt-qemu` (or the
-configured `DISPOSABLE_QEMU_USER`) through its parent directories. Prepare it
-once, outside audit sessions, with Ubuntu cloud-init, Python 3, qemu-guest-agent,
-Docker and pinned OpenCode, Semgrep CE, Gitleaks and Trivy versions. Enable
-qemu-guest-agent and Docker; remove build credentials and machine/session state
-before freezing it. Cache the approved offline Semgrep rules at
-`/opt/disposable/semgrep-rules`, Trivy databases and any Docker image/test
-packages required by your repo. Audit guests cannot install dependencies from
-the public internet: pre-cache them or grant an explicitly mediated dependency
-service. Do not enable a generic proxy or host package mount to work around this.
+There is no general DHCP, DNS, NAT or forwarding. Host nft bridge policy allows
+ARP and guest IPv4 TCP only to its distinct workload gateway port (default 8123).
+Other frames, including IPv6, are dropped; host inet rules deny other services
+and routed traffic on those bridges. Guest root can flush its own firewall but
+cannot change host policy. Existing host rules may reject even permitted relay
+traffic; that fails closed.
 
-OpenCode runs from `/var/lib/disposable`, outside repository configuration
-search, with a fresh HOME and inline configuration that selects only the exact
-TensorFold model, disables sharing/updates/provider discovery and denies task
-subagent delegation. Repository `.opencode` plugins are not loaded at startup.
-These settings prevent accidental fallback, but are not a boundary against
-malicious guest root; host policies provide that boundary. The prepared OpenCode
-build must include its OpenAI-compatible adapter so it does not fetch a provider
-package during an audit. Compatibility with the actual chosen model needs a
-Studio acceptance run.
+The gateway separately enforces capabilities, exact destination/method/path
+policy, DNS pinning, redirect rejection, credentials and stream revocation.
+Model/MCP upstream secrets remain on the host. The guest receives only its scoped
+capability. Timed capabilities expire with the session; until-deleted capabilities
+remain valid until explicit revoke/deletion. The management API is separate from
+the guest workload port. MCP transport access does not constrain the upstream
+server's tool semantics or the PAT's permissions.
 
-The host requires Linux pidfds (kernel 5.3+, Python 3.9+) and an active systemd system manager; timer arming failure prevents
-VM startup. The host needs KVM/libvirt, qemu-img, cloud-localds, nft, iproute2, runuser and Python 3.
-The state root/ancestor directories must allow qemu execute traversal (state
-root 0711, session 0711); sensitive host files are 0600. The runtime verifies
-that the qemu user can read the overlay and baseline before boot.
-`DISPOSABLE_GATEWAY_IP`/`DISPOSABLE_GATEWAY_PORT` must match the workload listener;
-use a dedicated otherwise-unused `/30`, first usable address, and a port other
-than 8120–8122. The gateway listens on its configured workload address/port and
-must be reachable after the bridge is created. `DISPOSABLE_STATE_ROOT` defaults
-to `/var/lib/agentic-sandbox/disposable`. `disposable-vm.sh check` fails clearly
-when required Linux/KVM/baseline support is absent; it never falls back to a
-container. This PR does not configure the user's actual PC or Studio.
+## Prepared baseline and acceptance
 
-## Verification
+The host needs Linux KVM/libvirt, nftables, systemd, Python 3 with pidfd support and
+the tools checked by `disposable-vm.sh check`. Its administrator-owned immutable
+Ubuntu baseline must contain cloud-init, qemu-guest-agent, pinned OpenCode with its
+OpenAI-compatible adapter, Docker and scanners. Cache approved Semgrep rules,
+Trivy databases and required dependency/container images: guests cannot download
+arbitrary packages from the internet. OpenCode starts with a fresh HOME and a
+host-generated configuration disabling provider fallback, sharing, updates and
+subagents. These settings are not protection against guest root; host policy is.
 
-Portable tests (no host operations):
+Portable runtime tests perform no host operations:
 
 ```sh
 python3 scripts/test-disposable-runtime.py
 ```
 
-On the designated Ubuntu host, after configuration and with no production run,
-stop the disposable controller (the harness exclusively locks its state root),
-start an **operator-owned disposable HTTP fixture** on a reachable LAN address,
-then run the acceptance harness. The `--blocked-target` must be reachable from
-the host, so a blocked guest result cannot be credited merely to an absent
-service. The baseline must cache the indicated Docker image. Port 8123 must be
-free for this temporary fake-token fixture.
+For real acceptance, use the designated Ubuntu PC with no production run and stop
+the controller while the harness owns its state root. Start an operator-owned
+HTTP fixture reachable from the host. The blocked target must actually respond
+on the host; the indicated Docker image must already be cached in the baseline.
+Keep workload port 8123 free for the temporary fake-token fixture.
 
 ```sh
 sudo -E scripts/disposable-vm.sh check
@@ -128,18 +107,14 @@ sudo -E python3 scripts/disposable-kvm-acceptance.py \
 ```
 
 The opt-in harness creates/removes only its own `asd-*` VM and policy resources.
-It checks guest Docker/tools, allowed fixture access, blocked host/LAN,
-management, metadata and direct IPv4/IPv6 access after guest root flushes its
-firewall, then repeated VM/disk/network cleanup and removal of its test UUID state, so
-controller startup does not encounter an incomplete acceptance record. It does not prove resistance to
-a hypervisor escape. A compromised qemu-guest-agent could lie about guest tests;
-for stronger acceptance also inspect host nft counters and packets independently.
-The portable tests are not evidence of measured KVM isolation. KVM acceptance,
-real Studio inference, actual Orca tool-call quality and long-context memory
-remain unverified on the development Mac.
+It checks guest Docker/tools, permitted fixture traffic, blocked host/LAN,
+management/metadata/direct IPv4/IPv6 traffic after guest root flushes its firewall,
+and repeated VM/disk/network cleanup. It does not prove protection against a
+hypervisor escape. Inspect host nft counters/packets independently when assessing
+isolation; a compromised guest agent can misreport guest checks.
 
-OpenCode configuration/CLI contracts follow the official
-[configuration](https://opencode.ai/docs/config/),
-[agent](https://opencode.ai/docs/agents/) and
-[CLI](https://opencode.ai/docs/cli/) documentation; pin and verify your baseline
-version rather than assuming the model repository name proves compatibility.
+The actual Ubuntu PC, real guest PTY/OpenCode compatibility and Studio model
+behavior remain untested by Mac fixture previews. Portable tests are not measured
+KVM isolation evidence. Unused private SDK dependencies have been removed and
+the full management native type-check passes. Linux compilation remains an
+independent requirement. Deployment scripts are in `deploy/local-ubuntu`.

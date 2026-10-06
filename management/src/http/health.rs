@@ -147,6 +147,7 @@ mod tests {
 
         AppState {
             disposable: None,
+            local_audits: None,
             registry,
             output_agg,
             dispatcher,

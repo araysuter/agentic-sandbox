@@ -41,6 +41,43 @@ class RuntimeTests(unittest.TestCase):
         self.env.stop()
         self.temporary.cleanup()
 
+    def test_network_slots_have_distinct_point_to_point_subnets(self):
+        (self.session / 'request.json').write_text(json.dumps({'network_slot': 0}))
+        first = runtime.network_settings(self.session)
+        (self.session / 'request.json').write_text(json.dumps({'network_slot': 1}))
+        second = runtime.network_settings(self.session)
+        self.assertEqual(first[:3], ('192.0.2.1', '192.0.2.2', '192.0.2.0/30'))
+        self.assertEqual(second[:3], ('192.0.2.5', '192.0.2.6', '192.0.2.4/30'))
+        policy = runtime.firewall_rules(self.session)
+        self.assertIn('ip saddr 192.0.2.6 ip daddr 192.0.2.5', policy)
+        (self.session / 'request.json').write_text(json.dumps({'network_slot': 3}))
+        self.assertEqual(runtime.network_settings(self.session)[:3], ('192.0.2.13', '192.0.2.14', '192.0.2.12/30'))
+        (self.session / 'request.json').write_text(json.dumps({'network_slot': True}))
+        with self.assertRaises(ValueError):
+            runtime.network_settings(self.session)
+
+    def test_until_deleted_start_has_no_deadline_timer(self):
+        runtime.atomic_json(self.session / 'request.json', {'kind': 'interactive', 'lifetime': 'until_deleted',
+            'memory_mb': 8192, 'vcpus': 2, 'deadline': None})
+        runtime.atomic_json(self.session / 'gateway.json', {'url': 'http://192.0.2.1:8123'})
+        launched = []
+        with patch.dict(os.environ, {'DISPOSABLE_BASE_IMAGE': '/prepared/baseline.qcow2'}), \
+             patch.object(runtime, 'preflight'), patch.object(runtime, 'process_start_time', return_value='123'), \
+             patch.object(runtime, 'arm_watchdog') as watchdog, patch.object(runtime, 'command'), \
+             patch.object(runtime, 'virsh'), patch.object(runtime, 'guest'), patch.object(runtime, 'guest_write'), \
+             patch.object(runtime, 'guest_exec', side_effect=lambda session, argv, **kw: launched.append(argv)):
+            runtime.start(self.session)
+        watchdog.assert_not_called()
+        workload = next(argv for argv in launched if argv[0] == '/usr/bin/systemd-run')
+        self.assertFalse(any('RuntimeMaxSec' in arg for arg in workload))
+        self.assertIn('/var/lib/disposable/run-audit.py', workload)
+        self.assertIn('8192', (self.session / 'vm/domain.xml').read_text())
+
+    def test_audit_cannot_choose_small_preset(self):
+        runtime.atomic_json(self.session / 'request.json', {'kind': 'audit', 'memory_mb': 12288, 'vcpus': 4})
+        with patch.object(runtime, 'preflight'), self.assertRaises(ValueError):
+            runtime.start(self.session)
+
     def test_directory_requires_uuid_and_no_escaping_symlinks(self):
         self.assertEqual(runtime.checked_dir(str(self.session)), self.session)
         with self.assertRaises(ValueError):

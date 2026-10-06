@@ -473,3 +473,5 @@ test('terminal exposes interactive/read-only posture, focus escape, and reduced 
     assert.ok(appSource.includes('terminal-focus-exit'));
     assert.match(styles, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
 });
+
+import './local-audits.test.mjs';

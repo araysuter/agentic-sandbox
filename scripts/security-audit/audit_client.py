@@ -326,7 +326,8 @@ def publish(api, report, private, week, checkpoint=None):
                     raise AuditError("Issue creation uncertain; rerun to reconcile before creating again") from exc
                 issue = matches[0]
             created += 1
-        published.append({"fingerprint": finding["fingerprint"], "url": issue["html_url"], "number": issue["number"]})
+        published.append({"fingerprint": finding["fingerprint"], "url": issue["html_url"], "number": issue["number"],
+                          "action": "updated" if previous else "created", "title": payload["title"]})
         if checkpoint:
             checkpoint({"published": published, "deferred": deferred, "private_review": [f["fingerprint"] for f in report["findings"] if f["sensitive"]], "repository_private": private})
     return {"published": published, "deferred": deferred, "private_review": [f["fingerprint"] for f in report["findings"] if f["sensitive"]], "repository_private": private}

@@ -1,0 +1,15 @@
+let repositories = ['TellTell', 'TensorFold', 'Scioly-Tests'].map((name, weekday) => ({ id: `demo-${weekday}`, repository: `demo/${name}`, model_id: 'studio', ref_name: '', enabled: true, publish_issues: true, credential_configured: true, schedule: { weekday, start_time: '01:00', end_time: '06:00', timezone: 'America/Detroit' }, next_run_at: new Date(Date.UTC(2026, 9, 12 + weekday, 5)).toISOString(), audit_profile: { test_commands: [['true']], scanners: ['semgrep', 'gitleaks', 'trivy'], scope: ['src'], exclusions: ['vendor/**'] } }));
+let runs = []; const calls = []; let busy = false; window.auditFixture = { calls, setBusy: value => { busy = value; }, get repositories() { return repositories; } };
+export const auditFixtureRequest = async (path, options) => {
+    const body = options.body ? JSON.parse(options.body) : null;
+    // Only retain sanitized call metadata; even test credentials are not logged.
+    calls.push({ path, method: options.method, body: body ? { ...body, github_token: body.github_token ? '[redacted]' : undefined } : null });
+    const id = path.split('/').at(-1);
+    if (options.method === 'GET' && path.endsWith('/report')) return { body: { completion: 'complete', coverage: { scanned_paths: ['src/api/auth.rs', 'src/api/routes.rs'], scanners: [{ name: 'Semgrep', status: 'passed', detail: 'Demo scan completed.' }], tests: [{ name: 'Authentication regression test', status: 'passed', detail: 'Demo test result.' }], skipped: [] }, findings: [{ title: 'Example authorization check missing', severity: 'medium', path: 'src/api/routes.rs', line_start: 42, impact: 'Demo finding: a route may return data before checking ownership.', evidence: 'Illustrative fixture only. No real repository was audited.', suggested_fix: 'Check the authenticated user’s ownership before returning the resource.', validated: true, sensitive: false }] } };
+    if (options.method === 'GET') return { body: { enabled: true, repositories, runs } };
+    if (options.method === 'POST' && path.endsWith('/run')) { if (busy) throw { status: 409 }; const repo = repositories.find(r => r.id === path.split('/').at(-2)); runs.push({ id: `run-${runs.length}`, repository: repo.repository, repository_id: repo.id, state: 'completed', created_at: new Date().toISOString(), result: { created: 0, updated: 0, withheld: 0, issues: [] } }); return { body: runs.at(-1) }; }
+    if (options.method === 'POST') { const { github_token, ...safe } = body; const repo = { ...safe, id: `demo-${repositories.length}`, credential_configured: !!github_token }; repositories.push(repo); return { body: repo }; }
+    if (options.method === 'PUT') { const { github_token, ...safe } = body; repositories = repositories.map(r => r.id === id ? { ...r, ...safe, credential_configured: r.credential_configured || !!github_token } : r); return { body: repositories.find(r => r.id === id) }; }
+    if (options.method === 'DELETE') { repositories = repositories.filter(r => r.id !== id); return { body: null }; }
+    throw Error('Unexpected fixture route');
+};

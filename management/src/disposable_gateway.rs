@@ -20,6 +20,9 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::sync::{watch, Semaphore};
 
+pub const EXA_PRESET: &str = "exa";
+pub const GITHUB_PRESET: &str = "github";
+
 const REQUEST_LIMIT: usize = 4 * 1024 * 1024;
 const RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -60,13 +63,13 @@ pub struct PresetInfo {
     pub credential_mediated: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GrantInfo {
     pub id: String,
     pub session_id: String,
     pub preset_id: String,
     pub kind: String,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
     pub gateway_path: String,
     pub base_path: String,
 }
@@ -78,10 +81,11 @@ struct Grant {
 }
 struct Session {
     token: String,
-    deadline: DateTime<Utc>,
+    deadline: Option<DateTime<Utc>>,
 }
 struct Inner {
     presets: BTreeMap<String, EndpointPreset>,
+    github_credentials: crate::github_credentials::GithubCredentials,
     traffic: Arc<Semaphore>,
     model: Arc<Semaphore>,
     sessions: Mutex<BTreeMap<String, Session>>,
@@ -90,7 +94,7 @@ struct Inner {
     allow_loopback_fixture: bool,
 }
 #[derive(Clone)]
-pub struct GatewayStore(Arc<Inner>);
+pub struct GatewayStore(Arc<Inner>, pub crate::disposable_console::ConsoleStore);
 
 impl GatewayStore {
     pub fn from_env() -> Result<Self, String> {
@@ -106,20 +110,48 @@ impl GatewayStore {
     pub fn new(presets: Vec<EndpointPreset>) -> Result<Self, String> {
         let mut configured = BTreeMap::new();
         for preset in presets {
+            if [EXA_PRESET, GITHUB_PRESET].contains(&preset.id.as_str()) {
+                return Err("exa and github endpoint preset IDs are reserved".into());
+            }
             validate_preset(&preset)?;
             if configured.insert(preset.id.clone(), preset).is_some() {
                 return Err("duplicate endpoint preset".into());
             }
         }
-        Ok(Self(Arc::new(Inner {
-            presets: configured,
-            traffic: Arc::new(Semaphore::new(8)),
-            model: Arc::new(Semaphore::new(1)),
-            sessions: Mutex::new(BTreeMap::new()),
-            grants: Mutex::new(BTreeMap::new()),
-            #[cfg(test)]
-            allow_loopback_fixture: false,
-        })))
+        for preset in builtin_mcp_presets() {
+            validate_preset(&preset)?;
+            configured.insert(preset.id.clone(), preset);
+        }
+        Ok(Self(
+            Arc::new(Inner {
+                presets: configured,
+                github_credentials: crate::github_credentials::GithubCredentials::default(),
+                traffic: Arc::new(Semaphore::new(8)),
+                model: Arc::new(Semaphore::new(1)),
+                sessions: Mutex::new(BTreeMap::new()),
+                grants: Mutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                allow_loopback_fixture: false,
+            }),
+            crate::disposable_console::ConsoleStore::default(),
+        ))
+    }
+    pub fn console(&self) -> crate::disposable_console::ConsoleStore {
+        self.1.clone()
+    }
+    pub fn authorize_console(&self, id: &str, headers: &HeaderMap) -> Result<(), StatusCode> {
+        let sessions = self.0.sessions.lock().unwrap();
+        let owner = sessions.get(id).ok_or(StatusCode::UNAUTHORIZED)?;
+        let supplied = headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !bool::from(owner.token.as_bytes().ct_eq(supplied.as_bytes())) || expired(owner.deadline)
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(())
     }
     pub fn presets(&self) -> Vec<PresetInfo> {
         self.0
@@ -133,12 +165,56 @@ impl GatewayStore {
                 path_prefixes: p.path_prefixes.clone(),
                 methods: p.methods.clone(),
                 allow_private: p.allow_private,
-                credential_mediated: p.credential_env.is_some(),
+                credential_mediated: p.credential_env.is_some() || p.id == GITHUB_PRESET,
             })
             .collect()
     }
-    pub fn create_session(&self, id: &str, deadline: DateTime<Utc>) -> Result<String, String> {
-        if !identifier(id) || deadline <= Utc::now() {
+    /// Called only by the authenticated host control plane. The secret never
+    /// appears in a gateway capability or guest OpenCode configuration.
+    pub fn set_github_token(
+        &self,
+        id: &str,
+        token: &str,
+        path: &std::path::Path,
+    ) -> Result<(), String> {
+        if !identifier(id) {
+            return Err("invalid session credential owner".into());
+        }
+        self.0.github_credentials.set(id, token, path)
+    }
+    pub fn restore_github_token(&self, id: &str, path: &std::path::Path) -> Result<bool, String> {
+        if !identifier(id) {
+            return Err("invalid restored credential owner".into());
+        }
+        self.0.github_credentials.restore(id, path)
+    }
+    pub fn github_token_configured(&self, id: &str) -> bool {
+        self.0.github_credentials.configured(id)
+    }
+    pub fn remove_github_token(&self, id: &str) -> Result<(), String> {
+        let ids: Vec<_> = self
+            .0
+            .grants
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|g| g.info.session_id == id && g.info.preset_id == GITHUB_PRESET)
+            .map(|g| g.info.id.clone())
+            .collect();
+        for grant in ids {
+            if let Some(g) = self.0.grants.lock().unwrap().remove(&grant) {
+                g.revoked.send_replace(true);
+            }
+        }
+        self.0.github_credentials.remove(id)
+    }
+    pub fn create_session(
+        &self,
+        id: &str,
+        deadline: impl Into<Option<DateTime<Utc>>>,
+    ) -> Result<String, String> {
+        let deadline = deadline.into();
+        if !identifier(id) || expired(deadline) {
             return Err("invalid session or deadline".into());
         }
         let mut sessions = self.0.sessions.lock().unwrap();
@@ -156,7 +232,79 @@ impl GatewayStore {
                 deadline,
             },
         );
+        self.1.create(id);
         Ok(token)
+    }
+    /// Restore only protected host records after the runtime verified the VM.
+    pub fn restore_session(
+        &self,
+        id: &str,
+        deadline: Option<DateTime<Utc>>,
+        token: &str,
+        grants: Vec<GrantInfo>,
+    ) -> Result<(), String> {
+        if !identifier(id) || expired(deadline) || token.len() != 64 || hex::decode(token).is_err()
+        {
+            return Err("invalid restored session".into());
+        }
+        let mut restored = Vec::new();
+        let mut ids = BTreeSet::new();
+        for info in grants {
+            if info.session_id != id
+                || !identifier(&info.id)
+                || !ids.insert(info.id.clone())
+                || deadline.is_some_and(|d| info.expires_at.is_none_or(|e| e > d))
+            {
+                return Err("invalid restored grant".into());
+            }
+            // Revocation/expiry limits endpoint access, never authorizes the
+            // destruction of an otherwise verified until-deleted workspace.
+            if expired(info.expires_at) {
+                continue;
+            }
+            let preset = self
+                .0
+                .presets
+                .get(&info.preset_id)
+                .ok_or("restored endpoint preset no longer exists")?
+                .clone();
+            let url =
+                reqwest::Url::parse(&preset.base_url).map_err(|_| "invalid restored endpoint")?;
+            if info.kind != preset.kind
+                || info.gateway_path != format!("/gateway/{id}/{}", info.id)
+                || info.base_path != preset_base_path(&preset, &url)
+            {
+                return Err("restored grant differs from host policy".into());
+            }
+            let (revoked, _) = watch::channel(false);
+            restored.push(Arc::new(Grant {
+                info,
+                preset,
+                revoked,
+                pinned: Mutex::new(None),
+            }));
+        }
+        let mut sessions = self.0.sessions.lock().unwrap();
+        if sessions.contains_key(id) {
+            return Err("gateway session already exists".into());
+        }
+        sessions.insert(
+            id.into(),
+            Session {
+                token: token.into(),
+                deadline,
+            },
+        );
+        let mut stored = self.0.grants.lock().unwrap();
+        if restored.iter().any(|g| stored.contains_key(&g.info.id)) {
+            sessions.remove(id);
+            return Err("restored grant ID collision".into());
+        }
+        for grant in restored {
+            stored.insert(grant.info.id.clone(), grant);
+        }
+        self.1.create(id);
+        Ok(())
     }
     pub fn guest_capability(&self, id: &str) -> Option<String> {
         self.0
@@ -170,11 +318,16 @@ impl GatewayStore {
         &self,
         session: &str,
         preset_id: &str,
-        expires_at: DateTime<Utc>,
+        expires_at: impl Into<Option<DateTime<Utc>>>,
     ) -> Result<GrantInfo, String> {
+        let expires_at = expires_at.into();
         let sessions = self.0.sessions.lock().unwrap();
         let owner = sessions.get(session).ok_or("unknown gateway session")?;
-        if expires_at <= Utc::now() || expires_at > owner.deadline {
+        if expired(expires_at)
+            || owner
+                .deadline
+                .is_some_and(|d| expires_at.is_none_or(|e| e > d))
+        {
             return Err("grant must expire within session deadline".into());
         }
         let preset = self
@@ -183,6 +336,9 @@ impl GatewayStore {
             .get(preset_id)
             .ok_or("unknown endpoint preset")?
             .clone();
+        if preset.id == GITHUB_PRESET && !self.github_token_configured(session) {
+            return Err("GitHub MCP requires a host-held session credential".into());
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let url = reqwest::Url::parse(&preset.base_url).map_err(|_| "invalid preset URL")?;
         let info = GrantInfo {
@@ -192,7 +348,7 @@ impl GatewayStore {
             kind: preset.kind.clone(),
             expires_at,
             gateway_path: format!("/gateway/{session}/{id}"),
-            base_path: url.path().trim_end_matches('/').to_owned(),
+            base_path: preset_base_path(&preset, &url),
         };
         let (revoked, _) = watch::channel(false);
         self.0.grants.lock().unwrap().insert(
@@ -213,22 +369,26 @@ impl GatewayStore {
             .unwrap()
             .values()
             .filter(|g| {
-                g.info.session_id == session
-                    && g.info.expires_at > Utc::now()
-                    && !*g.revoked.borrow()
+                g.info.session_id == session && !expired(g.info.expires_at) && !*g.revoked.borrow()
             })
             .map(|g| g.info.clone())
             .collect()
     }
     pub fn revoke_grant(&self, id: &str) -> bool {
-        if let Some(g) = self.0.grants.lock().unwrap().remove(id) {
+        let grant = self.0.grants.lock().unwrap().remove(id);
+        if let Some(g) = grant {
             g.revoked.send_replace(true);
+            if g.info.preset_id == GITHUB_PRESET {
+                let _ = self.remove_github_token(&g.info.session_id);
+            }
             true
         } else {
             false
         }
     }
     pub fn revoke_session(&self, session: &str) {
+        let _ = self.0.github_credentials.remove(session);
+        self.1.revoke(session);
         self.0.sessions.lock().unwrap().remove(session);
         let mut grants = self.0.grants.lock().unwrap();
         grants.retain(|_, g| {
@@ -253,8 +413,7 @@ impl GatewayStore {
             .and_then(|h| h.to_str().ok())
             .and_then(|h| h.strip_prefix("Bearer "))
             .unwrap_or("");
-        if !bool::from(owner.token.as_bytes().ct_eq(supplied.as_bytes()))
-            || owner.deadline <= Utc::now()
+        if !bool::from(owner.token.as_bytes().ct_eq(supplied.as_bytes())) || expired(owner.deadline)
         {
             return Err(StatusCode::UNAUTHORIZED);
         }
@@ -267,12 +426,21 @@ impl GatewayStore {
             .cloned()
             .ok_or(StatusCode::FORBIDDEN)?;
         if grant.info.session_id != session
-            || grant.info.expires_at <= Utc::now()
+            || expired(grant.info.expires_at)
             || *grant.revoked.borrow()
         {
             return Err(StatusCode::FORBIDDEN);
         }
         Ok(grant)
+    }
+}
+fn expired(time: Option<DateTime<Utc>>) -> bool {
+    time.is_some_and(|t| t <= Utc::now())
+}
+async fn wait_expiry(time: Option<DateTime<Utc>>) {
+    match time {
+        Some(t) => tokio::time::sleep((t - Utc::now()).to_std().unwrap_or_default()).await,
+        None => std::future::pending::<()>().await,
     }
 }
 fn identifier(s: &str) -> bool {
@@ -281,6 +449,39 @@ fn identifier(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+fn preset_base_path(preset: &EndpointPreset, url: &reqwest::Url) -> String {
+    if preset.id == GITHUB_PRESET {
+        url.path().to_owned()
+    } else {
+        url.path().trim_end_matches('/').to_owned()
+    }
+}
+
+fn builtin_mcp_presets() -> Vec<EndpointPreset> {
+    [
+        (EXA_PRESET, "https://mcp.exa.ai/mcp"),
+        (GITHUB_PRESET, "https://api.githubcopilot.com/mcp/"),
+    ]
+    .into_iter()
+    .map(|(id, url)| EndpointPreset {
+        id: id.into(),
+        kind: "mcp".into(),
+        model_name: None,
+        base_url: url.into(),
+        path_prefixes: vec![if id == GITHUB_PRESET {
+            "/mcp/".into()
+        } else {
+            "/mcp".into()
+        }],
+        methods: vec!["GET".into(), "POST".into(), "DELETE".into()],
+        allow_private: false,
+        credential_env: None,
+        credential_header: authorization(),
+        credential_prefix: bearer(),
+    })
+    .collect()
+}
+
 fn validate_preset(p: &EndpointPreset) -> Result<(), String> {
     if !identifier(&p.id) || !["model", "mcp", "dependency"].contains(&p.kind.as_str()) {
         return Err("invalid endpoint id or kind".into());
@@ -412,9 +613,11 @@ fn subscribe_active(grant: &Grant) -> Result<watch::Receiver<bool>, ()> {
 }
 
 pub fn router(store: GatewayStore) -> Router {
+    let console = crate::disposable_console::guest_router(store.clone());
     Router::new()
         .route("/gateway/{session}/{grant}/{*path}", any(relay))
         .with_state(store)
+        .merge(console)
 }
 fn error(status: StatusCode, message: &str) -> Response {
     Response::builder()
@@ -471,10 +674,7 @@ async fn relay(
         Ok(receiver) => receiver,
         Err(()) => return error(StatusCode::FORBIDDEN, "grant revoked"),
     };
-    let lifetime = (grant.info.expires_at - Utc::now())
-        .to_std()
-        .unwrap_or_default();
-    let deadline = tokio::time::Instant::now() + lifetime;
+    let expires_at = grant.info.expires_at;
     let operation = async {
         let mut url = reqwest::Url::parse(&grant.preset.base_url)
             .map_err(|_| error(StatusCode::BAD_GATEWAY, "invalid endpoint"))?;
@@ -538,13 +738,32 @@ async fn relay(
             }
         }
         let mut redacted_secret = None;
-        if let Some(reference) = &grant.preset.credential_env {
-            let secret = std::env::var(reference).map_err(|_| {
-                error(
-                    StatusCode::BAD_GATEWAY,
-                    "host endpoint credential unavailable",
-                )
-            })?;
+        let session_secret =
+            if grant.preset.id == GITHUB_PRESET {
+                Some(store.0.github_credentials.get(&session).ok_or_else(|| {
+                    error(StatusCode::UNAUTHORIZED, "host GitHub credential revoked")
+                })?)
+            } else {
+                None
+            };
+        let environment_secret = grant
+            .preset
+            .credential_env
+            .as_ref()
+            .map(|reference| {
+                std::env::var(reference).map_err(|_| {
+                    error(
+                        StatusCode::BAD_GATEWAY,
+                        "host endpoint credential unavailable",
+                    )
+                })
+            })
+            .transpose()?;
+        if let Some(secret) = session_secret
+            .as_ref()
+            .map(|s| s.expose())
+            .or(environment_secret.as_deref())
+        {
             if secret.len() < 8 || secret.len() > 8192 {
                 return Err(error(
                     StatusCode::BAD_GATEWAY,
@@ -574,7 +793,7 @@ async fn relay(
                 return Err(error(StatusCode::FORBIDDEN, "model identifier denied"));
             }
         }
-        if *grant.revoked.borrow() || grant.info.expires_at <= Utc::now() {
+        if *grant.revoked.borrow() || expired(grant.info.expires_at) {
             return Err(error(StatusCode::FORBIDDEN, "grant revoked or expired"));
         }
         let upstream = outbound
@@ -590,7 +809,7 @@ async fn relay(
     let (upstream, redacted_secret) = tokio::select! {
         biased;
         _=revoked.changed()=>return error(StatusCode::FORBIDDEN,"grant revoked"),
-        _=tokio::time::sleep_until(deadline)=>return error(StatusCode::FORBIDDEN,"grant expired"),
+        _=wait_expiry(expires_at)=>return error(StatusCode::FORBIDDEN,"grant expired"),
         result=operation=>match result{Ok(r)=>r,Err(response)=>return response},
     };
     if *revoked.borrow() {
@@ -605,6 +824,16 @@ async fn relay(
         "retry-after",
     ] {
         if let Some(value) = upstream.headers().get(name) {
+            // Remote metadata is untrusted too. An echoed upstream credential
+            // must not bypass the streaming body redactor through an MCP header.
+            if redacted_secret.as_ref().is_some_and(|secret| {
+                value
+                    .as_bytes()
+                    .windows(secret.len())
+                    .any(|part| part == secret.as_slice())
+            }) {
+                continue;
+            }
             builder = builder.header(name, value);
         }
     }
@@ -619,7 +848,7 @@ async fn relay(
             tokio::select!{
                 biased;
                 _=revoked.changed()=>break,
-                _=tokio::time::sleep_until(deadline)=>break,
+                _=wait_expiry(expires_at)=>break,
                 next=stream.next()=>match next{
                     Some(Ok(chunk))=>{received=received.saturating_add(chunk.len());if received>RESPONSE_LIMIT{yield Err(std::io::Error::other("gateway response exceeds limit"));break;}let safe=redactor.push(&chunk,false);if !safe.is_empty(){yield Ok(bytes::Bytes::from(safe));}},
                     Some(Err(_))=>{yield Err(std::io::Error::other("endpoint response interrupted"));break;},
@@ -1020,5 +1249,158 @@ mod tests {
             gw.abort();
         }
         up.abort();
+    }
+    #[test]
+    fn builtin_endpoints_are_fixed_and_github_requires_host_credential() {
+        let store = GatewayStore::new(vec![]).unwrap();
+        let endpoints = store.presets();
+        assert!(endpoints.iter().any(|p| p.id == EXA_PRESET
+            && p.base_url == "https://mcp.exa.ai/mcp"
+            && !p.credential_mediated));
+        assert!(endpoints.iter().any(|p| p.id == GITHUB_PRESET
+            && p.base_url == "https://api.githubcopilot.com/mcp/"
+            && p.credential_mediated));
+        store.create_session("host-session", None).unwrap();
+        assert!(store
+            .create_grant("host-session", GITHUB_PRESET, None)
+            .is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("github-token.key");
+        store
+            .set_github_token("host-session", "ghp_fixture_not_real_token", &path)
+            .unwrap();
+        let grant = store
+            .create_grant("host-session", GITHUB_PRESET, None)
+            .unwrap();
+        assert_eq!(grant.base_path, "/mcp/");
+        assert!(store.github_token_configured("host-session"));
+        assert!(store.revoke_grant(&grant.id));
+        assert!(!store.github_token_configured("host-session"));
+        assert!(!path.exists());
+        assert!(store
+            .create_grant("host-session", GITHUB_PRESET, None)
+            .is_err());
+    }
+    #[test]
+    fn persistent_host_credential_restores_without_leaking_into_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("github-token.key");
+        let secret = "github_pat_fixture_token_only";
+        let store = GatewayStore::new(vec![]).unwrap();
+        store.set_github_token("persisted", secret, &path).unwrap();
+        store.create_session("persisted", None).unwrap();
+        let grant = store
+            .create_grant("persisted", GITHUB_PRESET, None)
+            .unwrap();
+        let capability = store.guest_capability("persisted").unwrap();
+        let recovered = GatewayStore::new(vec![]).unwrap();
+        assert!(recovered.restore_github_token("persisted", &path).unwrap());
+        recovered
+            .restore_session("persisted", None, &capability, vec![grant])
+            .unwrap();
+        let encoded = serde_json::to_string(&recovered.list_grants("persisted")).unwrap();
+        assert!(!encoded.contains(secret));
+        recovered.revoke_session("persisted");
+        assert!(!path.exists());
+        assert!(!recovered.github_token_configured("persisted"));
+    }
+    #[tokio::test]
+    async fn github_secret_is_injected_on_host_and_reflection_is_redacted() {
+        use tower::ServiceExt;
+        let upstream = Router::new().route(
+            "/mcp/",
+            post(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers.get("authorization").unwrap(),
+                    "Bearer ghp_fixture_not_real_token"
+                );
+                assert_eq!(headers.get("mcp-protocol-version").unwrap(), "2025-03-26");
+                Response::builder()
+                    .header("mcp-session-id", "echo-ghp_fixture_not_real_token")
+                    .header("retry-after", "ghp_fixture_not_real_token")
+                    .body(Body::from("remote response ghp_fixture_not_real_token"))
+                    .unwrap()
+            }),
+        );
+        let (url, handle) = serve(upstream).await;
+        let mut store = GatewayStore::new(vec![]).unwrap();
+        let inner = Arc::get_mut(&mut store.0).unwrap();
+        inner.allow_loopback_fixture = true;
+        inner.presets.get_mut(GITHUB_PRESET).unwrap().base_url = format!("{url}/mcp/");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("github-token.key");
+        store
+            .set_github_token("host-session", "ghp_fixture_not_real_token", &path)
+            .unwrap();
+        let capability = store.create_session("host-session", None).unwrap();
+        let grant = store
+            .create_grant("host-session", GITHUB_PRESET, None)
+            .unwrap();
+        let gateway = router(store.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("{}{}/", grant.gateway_path, "/mcp"))
+            .header("authorization", format!("Bearer {capability}"))
+            .header("mcp-protocol-version", "2025-03-26")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = gateway.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_none());
+        assert!(response.headers().get("retry-after").is_none());
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("ghp_fixture_not_real_token"));
+        assert!(String::from_utf8_lossy(&bytes).contains("[REDACTED]"));
+        store.revoke_grant(&grant.id);
+        assert!(!path.exists());
+        handle.abort();
+    }
+
+    #[test]
+    fn restore_preserves_until_deleted_model_and_omits_expired_optional_mcp() {
+        let original = fixture_store("http://example.com");
+        let token = original.create_session("surviving-vm", None).unwrap();
+        let model = original
+            .create_grant("surviving-vm", "studio", None)
+            .unwrap();
+        let mut optional = model.clone();
+        optional.id = "expired-mcp".into();
+        optional.kind = "mcp".into();
+        optional.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        optional.preset_id = "retired-optional-preset".into();
+        let restored = fixture_store("http://example.com");
+        restored
+            .restore_session("surviving-vm", None, &token, vec![model.clone(), optional])
+            .unwrap();
+        assert_eq!(restored.list_grants("surviving-vm").len(), 1);
+        assert_eq!(restored.list_grants("surviving-vm")[0].id, model.id);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(restored.authorize_console("surviving-vm", &headers).is_ok());
+        restored.revoke_session("surviving-vm");
+        assert!(restored
+            .authorize_console("surviving-vm", &headers)
+            .is_err());
+    }
+
+    #[test]
+    fn restore_with_revoked_or_expired_model_preserves_console_without_access() {
+        let original = fixture_store("http://example.com");
+        let token = original.create_session("surviving-vm", None).unwrap();
+        let mut model = original
+            .create_grant("surviving-vm", "studio", None)
+            .unwrap();
+        model.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        let restored = fixture_store("http://example.com");
+        restored
+            .restore_session("surviving-vm", None, &token, vec![model])
+            .unwrap();
+        assert!(restored.list_grants("surviving-vm").is_empty());
+        assert!(restored.console().snapshot("surviving-vm", 0).is_ok());
+        let empty = fixture_store("http://example.com");
+        empty
+            .restore_session("surviving-vm", None, &token, vec![])
+            .unwrap();
+        assert!(empty.list_grants("surviving-vm").is_empty());
     }
 }

@@ -1,89 +1,98 @@
-# Disposable OpenCode sessions
+# Local OpenCode workspaces and repository audits
 
-The disposable profile adds a fresh KVM guest for each interactive session or
-weekly repository audit. Both enter the existing Rust management server through
-`/api/v2/disposable-sessions`, share a single capacity gate, and use the same
-host-owned expiry and destruction path. The defaults are 16 GiB RAM and six
-shared vCPUs. The Ubuntu host runs the VM; TensorFold and model weights remain
-on the Mac Studio. No GPU passthrough is required.
+The dashboard has two local flows. **Small workspaces** default to 8 GiB RAM,
+two shared vCPUs. **Medium workspaces** use 12 GiB and four shared vCPUs and “Keep until deleted.” **Security audits** use 16 GiB, six
+shared vCPUs and a scheduled deadline. The Ubuntu PC runs the VMs; TensorFold
+and model weights stay on the Mac Studio. No guest GPU passthrough is needed.
+
+## Interactive workspaces
+
+Create a named workspace and open its browser terminal. It is a real guest PTY,
+with keyboard input, resizing and streamed output over authenticated HTTP/SSE.
+OpenCode and shell commands execute in the guest. Closing or detaching the
+browser leaves the guest processes running; reconnect to continue. A terminal
+process that exits can be restarted without replacing the VM.
+
+One prepared Ubuntu base image backs separate writable overlays. Creating a
+workspace creates a fresh disk, workspace and OpenCode home. “Keep until deleted”
+preserves that VM until explicit deletion. A timed workspace is also available,
+up to five hours. Deletion is destructive: the UI asks for confirmation, then
+revokes access, stops the VM and purges its overlay, workspace, terminal output
+and session credential. Only a bounded deletion receipt remains. The reusable
+base image is kept.
+
+Exa MCP is available by default through the host relay. Supply an optional GitHub
+PAT when creating a workspace to enable GitHub MCP. The PAT is held on the host,
+separately from session metadata, and injected only into the approved upstream
+request. It does not become a guest environment variable or OpenCode secret.
+MCP access can perform whatever tools the upstream server and token permit;
+choose token permissions accordingly. Restart OpenCode to load added/changed
+endpoint configuration; revocation is immediate at the host relay. Studio
+credentials also stay on the host.
+
+## Capacity and recovery
+
+The global VM budget is **32 GiB RAM and eight shared vCPUs**:
+
+| Active VMs | Fits? |
+| --- | --- |
+| Four Small workspaces: 32 GiB / 8 vCPUs | Yes |
+| Two Medium workspaces: 24 GiB / 8 vCPUs | Yes |
+| One audit: 16 GiB / 6 vCPUs | Yes |
+| Small workspace + audit: 24 GiB / 8 vCPUs | Yes |
+| Medium workspace + audit: 28 GiB / 10 vCPUs | No |
+
+Admission fails immediately when the budget is unavailable, with no queue or
+preemption. A scheduled audit is recorded as busy/skipped; delete a workspace
+before its audit night if it would consume the required CPUs. Cleanup failures
+block admissions until containment is confirmed. VM capacity does not promise
+parallel model throughput: the Studio inference relay still bounds requests.
+
+A running “Keep until deleted” interactive VM survives a management restart only
+when the runtime and saved gateway state can be verified and restored. If recovery or guest tools fail, the workspace is marked unavailable and its disk and capacity stay reserved until explicit deletion. Timed/partial sessions and
+interrupted audits are cleaned up rather than resumed.
+
+## Scheduled repository audits
+
+Add a repository, save its fine-grained GitHub token on the Ubuntu host, and place
+a recurring event in the weekly calendar. Defaults are America/Detroit
+01:00–06:00 on separate nights. No audit workflow, GitHub Actions runner or
+submodule is needed.
 
 ```mermaid
 sequenceDiagram
-    participant Trigger as Dashboard or repo workflow
-    participant Host as Rust management server
-    participant VM as Disposable Ubuntu guest
-    participant Relay as Host endpoint gateway
-    participant Studio as TensorFold on Studio
-    Trigger->>Host: Admit session, pinned source, deadline
-    Host->>Host: Acquire capacity gate or return 409
-    Host->>VM: Fresh disk, workspace, guest-only Docker
-    VM->>Relay: Scoped model/MCP request
-    Relay->>Studio: Inference with host-only credential
-    Studio-->>VM: Streamed response through relay
-    VM-->>Host: Bounded report and completion status
-    Host->>Host: Validate, revoke grants, collect, destroy
-    Host-->>Trigger: Report and truthful cleanup status
+    participant UI as Dashboard calendar
+    participant Host as Ubuntu management service
+    participant GitHub
+    participant VM as Fresh audit VM
+    participant Studio as TensorFold
+    UI->>Host: Save repository, host token and weekly event
+    Host->>Host: Event due: reserve capacity or record busy skip
+    Host->>GitHub: Resolve default branch to commit; download data
+    Host->>VM: Pinned source and guest audit profile
+    VM->>Studio: One OpenCode investigator through scoped relay
+    VM->>VM: Scanners, tests and guest Docker
+    VM-->>Host: Bounded report and coverage
+    Host->>Host: Revoke access, destroy overlay, confirm cleanup
+    Host->>Host: Validate and redact findings
+    Host->>GitHub: Optionally publish 0–5 new deduplicated issues
+    Host-->>UI: Status, sanitized report and issue links
 ```
 
-The guest can run shell commands, tests, scanners, local MCP processes and its
-own Docker daemon. Guest root does not control the host firewall, management
-API, endpoint presets or upstream credentials. There are no general host
-filesystem shares, host sockets, persistent agent homes or GPU devices in this
-profile. The prepared baseline is reused through a new writable disk; each run
-gets a new OpenCode home and workspace.
+Guest root cannot control the host firewall, management API or credentials. There
+are no host project/home mounts, host Docker/libvirt sockets or persistent shared
+agent homes. Model/MCP transport uses exact host-defined destinations; direct
+host/LAN/internet access remains blocked by the runtime network policy.
 
-A separate guest data listener relays only operator-selected endpoint presets.
-Presets define an exact upstream host/port, URL path and methods, with explicit
-permission for a private Studio or MCP address. The gateway rejects redirects,
-CONNECT tunneling, unauthorized destinations and DNS address changes. Session
-capabilities do not authorize administration. Grant revocation and expiry stop
-new requests and close streams. A request already delivered to an upstream
-server cannot be retracted.
-
-MCP URL policy controls transport access. It does not make an MCP server's tools
-read-only. Use upstream credentials/server capabilities appropriate to the
-session; never rely on allowing HTTP POST alone as a restriction on write tools.
-Remote Streamable HTTP/SSE traverses the relay; local stdio MCP stays in the VM.
-
-The host keeps admission ownership through collection and cleanup. Failed
-cleanup remains visible and prevents another disposable run until containment
-is confirmed. Restart reconciliation revokes in-memory access and retries
-cleanup of recorded runs. This admission policy covers the new disposable API;
-legacy persistent VM/container paths retain their existing behavior and should
-not be used to circumvent the single-model capacity policy.
-
-## Weekly repository audits
-
-Each repository has its own small scheduled workflow referencing the reusable
-workflow in this fork at a reviewed commit SHA. There is no Git submodule.
-Separate weekly nights use the America/Detroit 01:00–06:00 window. The trusted
-host adapter submits the repository, exact commit and GitHub run identity;
-repository tests and hooks execute only inside the guest. The host enforces the
-actual wall-clock cutoff and reserves time for collection and cleanup.
-
-Only the host publisher receives the repository-scoped `GITHUB_TOKEN`. It
-validates and redacts the guest report, checks repository/commit provenance,
-deduplicates findings, and publishes zero to five new actionable issues. More
-findings remain in the report. Sensitive findings in public repositories go to
-private review by default. Valid JSON and a scanner warning are not proof of a
-real vulnerability: findings require supporting evidence, and incomplete audits
-must remain marked incomplete.
-
-GitHub can queue a job before it reaches an idle runner. The controller rejects
-busy admissions immediately after the job reaches it. Another idle trusted
-runner listener is needed to reject overlapping arrivals promptly. Per-repo
-GitHub concurrency groups alone do not protect shared model capacity.
-
-Read [API and host policy configuration](disposable-api.md),
-[weekly audit workflows and reporting](weekly-security-audits.md) for caller
-examples and [runtime configuration and acceptance](disposable-runtime.md) for
-the KVM baseline, privileged runtime boundary and Ubuntu acceptance commands.
+Read [calendar timing and reporting](weekly-security-audits.md),
+[API behavior](disposable-api.md), and
+[Ubuntu runtime acceptance](disposable-runtime.md).
 
 ## Verification boundary
 
-Portable Rust, Python and dashboard tests use fixture model/MCP/GitHub services.
-They verify policy and lifecycle behavior without contacting the Studio, using
-real tokens or publishing security findings. Actual Ubuntu KVM isolation,
-guest Docker/tool availability, OpenCode interoperability and the selected
-OrcaSAQ checkpoint require the documented host acceptance run. Mocked tests do
-not establish a VM escape-proof boundary or measured model audit quality.
+Mac previews and portable tests use fixture services. They do not establish real
+Ubuntu KVM isolation, guest Docker/tool availability, PTY/OpenCode compatibility,
+Studio checkpoint behavior or measured vulnerability-finding quality. The full
+management native type-check passes after removing unused private SDK
+dependencies. Linux compilation and actual Ubuntu/Studio acceptance are required
+before operational use. The opt-in installer is in `deploy/local-ubuntu`.

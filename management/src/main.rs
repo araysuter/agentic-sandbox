@@ -42,8 +42,10 @@ mod crash_loop;
 mod credentials;
 mod dispatch;
 mod disposable;
+mod disposable_console;
 mod disposable_gateway;
 mod docker_runtime;
+mod github_credentials;
 mod grpc;
 mod grpc_ca_backend;
 mod grpc_ca_provider_protocol;
@@ -56,6 +58,7 @@ mod http;
 mod identity;
 #[cfg(feature = "linux-vm")]
 mod libvirt_events;
+mod local_audits;
 pub mod orchestrator;
 mod output;
 mod prompt_detector;
@@ -1229,6 +1232,8 @@ async fn main() -> Result<()> {
             }
         });
     }
+    let local_audits =
+        local_audits::LocalAuditService::from_env(disposable_controller.clone()).await?;
     // Start HTTP server in background
     let mcp_config = crate::http::mcp::McpConfig::load(std::path::Path::new(&config.secrets_dir))?;
     let http_server = HttpServer::new(
@@ -1238,6 +1243,7 @@ async fn main() -> Result<()> {
         dispatcher.clone(),
     )
     .with_disposable(disposable_controller)
+    .with_local_audits(local_audits)
     .with_orchestrator(orchestrator.clone())
     .with_activity_store(activity_store)
     .with_metrics(telemetry_guard.metrics.clone())

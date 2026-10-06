@@ -115,6 +115,7 @@ struct Assets;
 /// Shared state for HTTP handlers
 #[derive(Clone)]
 pub struct AppState {
+    pub local_audits: Option<Arc<crate::local_audits::LocalAuditService>>,
     pub disposable: Option<Arc<crate::disposable::DisposableController>>,
     pub registry: Arc<AgentRegistry>,
     pub output_agg: Arc<OutputAggregator>,
@@ -214,6 +215,7 @@ impl AppState {
     ) -> Self {
         Self {
             disposable: None,
+            local_audits: None,
             registry,
             output_agg,
             dispatcher,
@@ -289,6 +291,15 @@ impl HttpServer {
         controller: Option<Arc<crate::disposable::DisposableController>>,
     ) -> Self {
         self.state.disposable = controller;
+        self
+    }
+
+    /// Enable dashboard-owned local repository schedules.
+    pub fn with_local_audits(
+        mut self,
+        service: Option<Arc<crate::local_audits::LocalAuditService>>,
+    ) -> Self {
+        self.state.local_audits = service;
         self
     }
 
@@ -531,6 +542,7 @@ impl HttpServer {
             .route("/api/v1/health/ready", get(readiness_handler))
             .route("/api/v1/health/live", get(liveness_handler))
             .nest("/api/v2/disposable-sessions", super::disposable::router())
+            .nest("/api/v2/local-audits", super::local_audits::router())
             .nest("/api/v2/credentials", credentials::router())
             .nest("/api/v2/credential-proxy", credential_proxy::router())
             .nest("/api/v2/startup-profiles", startup_profile_router)

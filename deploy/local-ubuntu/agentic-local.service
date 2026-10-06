@@ -1,0 +1,23 @@
+[Unit]
+Description=Agentic Sandbox local VM dashboard and audit scheduler
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/agentic-sandbox
+EnvironmentFile=/etc/agentic-sandbox/management.env
+EnvironmentFile=-/etc/agentic-sandbox/model-secret.env
+ExecStartPre=/usr/bin/test -s /var/lib/agentic-sandbox/secrets/operator-tokens.toml
+ExecStart=/opt/agentic-sandbox/current/agentic-management
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+# Root is necessary for per-VM libvirt, bridge, nft, and deadline resources.
+# No host Docker socket or user home is mounted into any guest.
+
+[Install]
+WantedBy=multi-user.target

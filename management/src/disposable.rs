@@ -16,6 +16,39 @@ use tokio::process::Command;
 pub const MAX_SOURCE: usize = 100 * 1024 * 1024;
 pub const MAX_REPORT: u64 = 2 * 1024 * 1024;
 const CLEANUP_RESERVE: i64 = 300;
+pub const MAX_MEMORY_MB: u32 = 32768;
+pub const MAX_VCPUS: u8 = 8;
+fn lifetime() -> String {
+    "timed".into()
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ResourceUsage {
+    pub memory_mb_used: u64,
+    pub memory_mb_available: u64,
+    pub memory_mb_limit: u32,
+    pub vcpus_used: u64,
+    pub vcpus_available: u64,
+    pub vcpus_limit: u8,
+    pub blocked: bool,
+}
+fn usage(sessions: &BTreeMap<String, Session>) -> ResourceUsage {
+    let active: Vec<_> = sessions.values().filter(|s| !s.terminal()).collect();
+    let memory_mb_used = active.iter().map(|s| u64::from(s.request.memory_mb)).sum();
+    let vcpus_used = active.iter().map(|s| u64::from(s.request.vcpus)).sum();
+    ResourceUsage {
+        memory_mb_used,
+        vcpus_used,
+        memory_mb_available: u64::from(MAX_MEMORY_MB).saturating_sub(memory_mb_used),
+        vcpus_available: u64::from(MAX_VCPUS).saturating_sub(vcpus_used),
+        memory_mb_limit: MAX_MEMORY_MB,
+        vcpus_limit: MAX_VCPUS,
+        blocked: active.iter().any(|s| s.state == "cleanup_failed"),
+    }
+}
+fn fits(sessions: &BTreeMap<String, Session>, memory: u32, cpus: u8) -> bool {
+    let u = usage(sessions);
+    !u.blocked && u.memory_mb_available >= memory.into() && u.vcpus_available >= cpus.into()
+}
 fn memory() -> u32 {
     16384
 }
@@ -32,6 +65,10 @@ fn model() -> String {
 #[serde(deny_unknown_fields)]
 pub struct CreateRequest {
     pub kind: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "lifetime")]
+    pub lifetime: String,
     pub repository: Option<String>,
     pub commit: Option<String>,
     pub run_id: Option<String>,
@@ -85,11 +122,33 @@ pub struct RepositoryPolicy {
 }
 impl CreateRequest {
     pub fn validated_deadline(&self, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+        self.validated_deadline_for(now, false)?
+            .ok_or_else(|| "until_deleted sessions have no deadline".into())
+    }
+    fn validated_deadline_for(
+        &self,
+        now: DateTime<Utc>,
+        local_schedule: bool,
+    ) -> Result<Option<DateTime<Utc>>, String> {
         if !["audit", "interactive"].contains(&self.kind.as_str()) {
             return Err("kind must be audit or interactive".into());
         }
-        if self.memory_mb != 16384 || self.vcpus != 6 {
-            return Err("disposable profile requires 16384 MiB and 6 shared vCPUs".into());
+        if ![(8192, 2), (12288, 4), (16384, 6)].contains(&(self.memory_mb, self.vcpus))
+            || (self.kind == "audit" && (self.memory_mb, self.vcpus) != (16384, 6))
+        {
+            return Err("choose Small (8192 MiB/2 vCPUs), Medium (12288 MiB/4 vCPUs), or Security (16384 MiB/6 vCPUs); audits require Security".into());
+        }
+        if !["timed", "until_deleted"].contains(&self.lifetime.as_str())
+            || (self.kind == "audit" && self.lifetime != "timed")
+        {
+            return Err("until_deleted is only available for interactive sessions".into());
+        }
+        if self
+            .name
+            .as_ref()
+            .is_some_and(|n| n.is_empty() || n.len() > 100 || n.chars().any(char::is_control))
+        {
+            return Err("name must be 1..100 bytes without control characters".into());
         }
         if self.duration_seconds == 0 || self.duration_seconds > 18000 {
             return Err("duration_seconds must be 1..18000".into());
@@ -132,11 +191,17 @@ impl CreateRequest {
         {
             return Err("audit requires repository, commit and bounded run_id".into());
         }
+        if self.lifetime == "until_deleted" {
+            if self.deadline.is_some() {
+                return Err("until_deleted sessions cannot set a deadline".into());
+            }
+            return Ok(None);
+        }
         let mut deadline = now + Duration::seconds(self.duration_seconds.into());
         if let Some(requested) = self.deadline {
             deadline = deadline.min(requested);
         }
-        if self.kind == "audit" {
+        if self.kind == "audit" && !local_schedule {
             let local = now.with_timezone(&chrono_tz::America::Detroit);
             if !(1..6).contains(&local.hour()) {
                 return Err("audit admission is restricted to 01:00-06:00 America/Detroit".into());
@@ -156,7 +221,7 @@ impl CreateRequest {
         } else if deadline <= now + Duration::seconds(30) {
             return Err("deadline must allow at least 30 seconds".into());
         }
-        Ok(deadline)
+        Ok(Some(deadline))
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -165,7 +230,9 @@ pub struct Session {
     pub state: String,
     pub request: CreateRequest,
     pub created_at: DateTime<Utc>,
-    pub deadline: DateTime<Utc>,
+    pub deadline: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub network_slot: u8,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
     #[serde(default)]
@@ -173,7 +240,7 @@ pub struct Session {
 }
 impl Session {
     pub fn terminal(&self) -> bool {
-        ["completed", "failed", "cancelled"].contains(&self.state.as_str())
+        ["completed", "failed", "cancelled", "deleted"].contains(&self.state.as_str())
     }
 }
 #[derive(Debug)]
@@ -191,6 +258,7 @@ pub struct DisposableController {
     pub gateway: GatewayStore,
     repository_policies: BTreeMap<String, RepositoryPolicy>,
     operator_operation: tokio::sync::Mutex<()>,
+    grant_persistence: Mutex<()>,
     _process_lock: fs::File,
 }
 impl DisposableController {
@@ -262,6 +330,8 @@ impl DisposableController {
                         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                         .unwrap_or_else(|| CreateRequest {
                             kind: "interactive".into(),
+                            name: None,
+                            lifetime: lifetime(),
                             repository: None,
                             commit: None,
                             run_id: None,
@@ -278,7 +348,8 @@ impl DisposableController {
                         state: "cleaning".into(),
                         request,
                         created_at: Utc::now(),
-                        deadline: Utc::now(),
+                        deadline: Some(Utc::now()),
+                        network_slot: 0,
                         finished_at: None,
                         error: Some("partial provisioning metadata recovered for cleanup".into()),
                         cancelled: false,
@@ -341,8 +412,10 @@ impl DisposableController {
             gateway,
             repository_policies,
             operator_operation: tokio::sync::Mutex::new(()),
+            grant_persistence: Mutex::new(()),
             _process_lock: process_lock,
         });
+        controller.prune_history();
         let pending: Vec<_> = controller
             .list()
             .into_iter()
@@ -351,6 +424,41 @@ impl DisposableController {
             .collect();
         for id in pending {
             let c = controller.clone();
+            let session = c.get(&id).unwrap();
+            if session.request.kind == "interactive"
+                && session.request.lifetime == "until_deleted"
+                && ["running", "unavailable"].contains(&session.state.as_str())
+                && !session.cancelled
+            {
+                let restored = async {
+                    let status = c.command("status", &c.dir(&id), 20).await?;
+                    if status["state"] != "running" {
+                        return Err("persistent VM is not running".to_string());
+                    }
+                    let bytes = fs::read(c.dir(&id).join("gateway-state.json"))
+                        .map_err(|e| e.to_string())?;
+                    if bytes.len() > 65536 {
+                        return Err("gateway state exceeds bound".into());
+                    }
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                    let token = v["token"].as_str().ok_or("missing capability")?;
+                    let grants =
+                        serde_json::from_value(v["grants"].clone()).map_err(|e| e.to_string())?;
+                    c.gateway
+                        .restore_github_token(&id, &c.dir(&id).join("github-token.key"))?;
+                    c.gateway.restore_session(&id, None, token, grants)?;
+                    Ok::<_, String>(())
+                }
+                .await;
+                if restored.is_err() {
+                    let _ = c.update(&id, "unavailable", Some("Workspace recovery needs attention; files and capacity retained until deletion".into()));
+                }
+                tokio::spawn(async move {
+                    c.monitor(&id).await;
+                });
+                continue;
+            }
             tokio::spawn(async move {
                 c.cleanup_loop(
                     &id,
@@ -364,6 +472,12 @@ impl DisposableController {
     }
     pub fn list(&self) -> Vec<Session> {
         self.sessions.lock().values().cloned().collect()
+    }
+    pub fn resource_usage(&self) -> ResourceUsage {
+        usage(&self.sessions.lock())
+    }
+    pub fn can_admit(&self, memory: u32, cpus: u8) -> bool {
+        fits(&self.sessions.lock(), memory, cpus)
     }
     pub fn get(&self, id: &str) -> Result<Session, Error> {
         self.sessions.lock().get(id).cloned().ok_or(Error::NotFound)
@@ -390,8 +504,39 @@ impl DisposableController {
         sessions.insert(id.to_string(), next);
         Ok(())
     }
-    pub async fn create(self: &Arc<Self>, mut request: CreateRequest) -> Result<Session, Error> {
-        if request.kind == "audit" {
+    pub async fn create(self: &Arc<Self>, request: CreateRequest) -> Result<Session, Error> {
+        self.create_inner(request, false, None).await
+    }
+    /// Only the authenticated host-owned scheduler may select its own profile/window.
+    /// This method is never exposed by the disposable session HTTP API.
+    pub(crate) async fn create_local_audit(
+        self: &Arc<Self>,
+        request: CreateRequest,
+    ) -> Result<Session, Error> {
+        if request.kind != "audit" {
+            return Err(Error::Invalid("local scheduler requires audit kind".into()));
+        }
+        self.create_inner(request, true, None).await
+    }
+    pub async fn create_with_github_token(
+        self: &Arc<Self>,
+        request: CreateRequest,
+        token: Option<String>,
+    ) -> Result<Session, Error> {
+        if token.is_some() && request.kind != "interactive" {
+            return Err(Error::Invalid(
+                "GitHub tokens are only accepted for interactive sessions".into(),
+            ));
+        }
+        self.create_inner(request, false, token).await
+    }
+    async fn create_inner(
+        self: &Arc<Self>,
+        mut request: CreateRequest,
+        local_schedule: bool,
+        github_token: Option<String>,
+    ) -> Result<Session, Error> {
+        if request.kind == "audit" && !local_schedule {
             let policy = self
                 .repository_policies
                 .get(request.repository.as_deref().unwrap_or(""))
@@ -408,7 +553,7 @@ impl DisposableController {
                 ));
             }
             request.audit_profile = policy.audit_profile.clone();
-        } else {
+        } else if request.kind != "audit" {
             request.audit_profile = AuditProfile::default();
         }
         if request.kind == "audit" {
@@ -426,10 +571,12 @@ impl DisposableController {
             }
         }
         let now = Utc::now();
-        let deadline = request.validated_deadline(now).map_err(Error::Invalid)?;
-        request.deadline = Some(deadline);
+        let deadline = request
+            .validated_deadline_for(now, local_schedule)
+            .map_err(Error::Invalid)?;
+        request.deadline = deadline;
         // Fast rejection precedes slow runtime preflight. Recheck atomically after it.
-        if self.list().iter().any(|s| !s.terminal()) {
+        if !self.can_admit(request.memory_mb, request.vcpus) {
             return Err(Error::Busy);
         }
         if !self
@@ -444,13 +591,20 @@ impl DisposableController {
             .await
             .map_err(Error::Unavailable)?;
         request
-            .validated_deadline(Utc::now())
+            .validated_deadline_for(Utc::now(), local_schedule)
             .map_err(Error::Invalid)?;
         let s = {
             let mut sessions = self.sessions.lock();
-            if sessions.values().any(|s| !s.terminal()) {
+            if !fits(&sessions, request.memory_mb, request.vcpus) {
                 return Err(Error::Busy);
             }
+            let network_slot = (0..4)
+                .find(|slot| {
+                    !sessions
+                        .values()
+                        .any(|s| !s.terminal() && s.network_slot == *slot)
+                })
+                .ok_or(Error::Busy)?;
             let id = uuid::Uuid::new_v4().to_string();
             let s = Session {
                 id: id.clone(),
@@ -463,6 +617,7 @@ impl DisposableController {
                 request,
                 created_at: now,
                 deadline,
+                network_slot,
                 finished_at: None,
                 error: None,
                 cancelled: false,
@@ -474,9 +629,24 @@ impl DisposableController {
                 fs::set_permissions(self.dir(&id), fs::Permissions::from_mode(0o700))
                     .map_err(|e| Error::Internal(e.to_string()))?;
             }
-            write_json(&self.dir(&id).join("request.json"), &s.request)
+            let mut runtime_request =
+                serde_json::to_value(&s.request).map_err(|e| Error::Internal(e.to_string()))?;
+            runtime_request["network_slot"] = serde_json::json!(network_slot);
+            write_json(&self.dir(&id).join("request.json"), &runtime_request)
                 .map_err(|e| Error::Internal(e.to_string()))?;
             self.persist(&s)?;
+            if let Some(token) = github_token.as_deref() {
+                if let Err(error) = self.gateway.set_github_token(
+                    &id,
+                    token,
+                    &self.dir(&id).join("github-token.key"),
+                ) {
+                    // No VM has started yet; a failed credential save cannot leave an untracked allocation.
+                    fs::remove_dir_all(self.dir(&id))
+                        .map_err(|e| Error::Internal(e.to_string()))?;
+                    return Err(Error::Invalid(error));
+                }
+            }
             sessions.insert(id, s.clone());
             s
         };
@@ -596,15 +766,26 @@ impl DisposableController {
         loop {
             let Ok(s) = self.get(id) else { return };
             if s.cancelled
-                || Utc::now()
-                    >= s.deadline
-                        - Duration::seconds(
+                || s.deadline.is_some_and(|d| {
+                    Utc::now()
+                        >= d - Duration::seconds(
                             CLEANUP_RESERVE.min((s.request.duration_seconds / 4).into()),
                         )
+                })
+                || (s.state == "awaiting_source"
+                    && Utc::now() >= s.created_at + Duration::minutes(10))
             {
                 self.cleanup_loop(
                     id,
-                    if s.cancelled { "cancelled" } else { "failed" },
+                    if s.cancelled {
+                        if s.request.lifetime == "until_deleted" {
+                            "deleted"
+                        } else {
+                            "cancelled"
+                        }
+                    } else {
+                        "failed"
+                    },
                     Some("cancelled or source staging deadline reached".into()),
                 )
                 .await;
@@ -620,6 +801,11 @@ impl DisposableController {
             self.gateway.create_session(id, s.deadline)?;
             self.gateway
                 .create_grant(id, &s.request.model_id, s.deadline)?;
+            for preset in self.gateway.presets().into_iter().filter(|p| {
+                p.id == "exa" || (p.id == "github" && self.gateway.github_token_configured(id))
+            }) {
+                self.gateway.create_grant(id, &preset.id, s.deadline)?;
+            }
             self.write_gateway_config(id)
                 .map_err(|_| "could not write scoped gateway configuration".to_string())
         })();
@@ -627,7 +813,10 @@ impl DisposableController {
             self.cleanup_loop(id, "failed", Some(e)).await;
             return;
         }
-        let start_limit = (s.deadline - Utc::now()).num_seconds().max(1).min(600) as u64;
+        let start_limit = s
+            .deadline
+            .map(|d| (d - Utc::now()).num_seconds().clamp(1, 600) as u64)
+            .unwrap_or(600);
         let start_result = {
             let session_dir = self.dir(id);
             let start = self.command("start", &session_dir, start_limit);
@@ -637,7 +826,7 @@ impl DisposableController {
                     result=&mut start=>break result,
                     _=tokio::time::sleep(std::time::Duration::from_secs(1))=>{
                         let session=self.get(id).unwrap();
-                        if session.cancelled || Utc::now()>=session.deadline-Duration::seconds(if session.request.kind=="audit"{CLEANUP_RESERVE}else{30}) {
+                        if session.cancelled || session.deadline.is_some_and(|d| Utc::now()>=d-Duration::seconds(if session.request.kind=="audit"{CLEANUP_RESERVE}else{30})) {
                             break Err("provisioning cancelled or exceeded workload deadline".into());
                         }
                     }
@@ -660,12 +849,19 @@ impl DisposableController {
             .await;
             return;
         }
+        self.monitor(id).await;
+    }
+    async fn monitor(self: Arc<Self>, id: &str) {
         let mut outcome = "completed";
         let mut failure = None;
         loop {
             let s = self.get(id).unwrap();
             if s.cancelled {
-                outcome = "cancelled";
+                outcome = if s.request.lifetime == "until_deleted" {
+                    "deleted"
+                } else {
+                    "cancelled"
+                };
                 break;
             }
             let reserve = if s.request.kind == "audit" {
@@ -673,7 +869,9 @@ impl DisposableController {
             } else {
                 30
             };
-            if Utc::now() >= s.deadline - Duration::seconds(reserve) {
+            if s.deadline
+                .is_some_and(|d| Utc::now() >= d - Duration::seconds(reserve))
+            {
                 outcome = if s.request.kind == "audit" {
                     "failed"
                 } else {
@@ -683,7 +881,22 @@ impl DisposableController {
                     Some("session reached workload cutoff; retained report is partial".into());
                 break;
             }
-            match self.command("status", &self.dir(id), 20).await {
+            let status = self.command("status", &self.dir(id), 20).await;
+            if s.request.lifetime == "until_deleted" {
+                // A stopped process or temporary transport failure must not erase user work.
+                if status.as_ref().is_ok_and(|v| v["state"] == "running")
+                    && self.gateway.guest_capability(id).is_some()
+                {
+                    if s.state != "running" {
+                        let _ = self.update(id, "running", None);
+                    }
+                } else {
+                    let _ = self.update(id, "unavailable", Some("Guest tools are unavailable; VM storage and capacity are retained until you delete it".into()));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                continue;
+            }
+            match status {
                 Ok(v) => match v.get("state").and_then(|v| v.as_str()) {
                     Some("completed") => break,
                     Some("failed" | "stopped") => {
@@ -707,18 +920,20 @@ impl DisposableController {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
         let _ = self.update(id, "collecting", None);
-        if let Err(e) = self.command("collect", &self.dir(id), 60).await {
-            if outcome == "completed" {
-                outcome = "failed";
+        if self.get(id).is_ok_and(|s| s.request.kind == "audit") {
+            if let Err(e) = self.command("collect", &self.dir(id), 60).await {
+                if outcome == "completed" {
+                    outcome = "failed";
+                }
+                failure = Some(e);
             }
-            failure = Some(e);
-        }
-        if outcome != "completed" {
-            if let Ok(bytes) = self.bounded_file(id, "report.json") {
-                if let Ok(mut report) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if report.get("completion").and_then(|v| v.as_str()) == Some("complete") {
-                        report["completion"] = serde_json::Value::String("partial".into());
-                        let _ = write_json(&self.dir(id).join("report.json"), &report);
+            if outcome != "completed" {
+                if let Ok(bytes) = self.bounded_file(id, "report.json") {
+                    if let Ok(mut report) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if report.get("completion").and_then(|v| v.as_str()) == Some("complete") {
+                            report["completion"] = serde_json::Value::String("partial".into());
+                            let _ = write_json(&self.dir(id).join("report.json"), &report);
+                        }
                     }
                 }
             }
@@ -735,7 +950,19 @@ impl DisposableController {
             drop(operation);
             match stop {
                 Ok(_) => {
+                    if self.get(id).is_ok_and(|s| s.request.kind == "interactive") {
+                        if let Err(e) = self.purge_interactive(id) {
+                            let _ = self.update(
+                                id,
+                                "cleanup_failed",
+                                Some(format!("VM stopped but storage removal failed: {e}")),
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            continue;
+                        }
+                    }
                     if self.update(id, outcome, None).is_ok() {
+                        self.prune_history();
                         return;
                     }
                     let _=self.update(id,"cleanup_failed",Some("containment succeeded but terminal state could not be durably recorded".into()));
@@ -746,6 +973,37 @@ impl DisposableController {
             }
             // Never release admission while a VM or network policy may remain.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    }
+    fn purge_interactive(&self, id: &str) -> std::io::Result<()> {
+        // Keep only a small, bounded deletion receipt. Never unlink a live disk.
+        for entry in fs::read_dir(self.dir(id))? {
+            let entry = entry?;
+            if entry.file_name() == "session.json" {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+    fn prune_history(&self) {
+        let mut sessions = self.sessions.lock();
+        let mut terminal: Vec<_> = sessions
+            .values()
+            .filter(|s| s.terminal())
+            .map(|s| (s.finished_at, s.id.clone()))
+            .collect();
+        terminal.sort();
+        let excess = terminal.len().saturating_sub(200);
+        for (_, id) in terminal.into_iter().take(excess) {
+            if fs::remove_dir_all(self.dir(&id)).is_ok() {
+                sessions.remove(&id);
+            }
         }
     }
     pub fn bounded_file(&self, id: &str, name: &str) -> Result<Vec<u8>, Error> {
@@ -795,7 +1053,21 @@ impl DisposableController {
         }
         Ok(bytes)
     }
+    pub fn persist_grants(&self, id: &str) -> Result<(), Error> {
+        let _serial = self.grant_persistence.lock();
+        self.get(id)?;
+        let token = self
+            .gateway
+            .guest_capability(id)
+            .ok_or_else(|| Error::Invalid("session capability revoked".into()))?;
+        write_json(
+            &self.dir(id).join("gateway-state.json"),
+            &serde_json::json!({"token":token,"grants":self.gateway.list_grants(id)}),
+        )
+        .map_err(|e| Error::Internal(e.to_string()))
+    }
     fn write_gateway_config(&self, id: &str) -> Result<(), Error> {
+        self.persist_grants(id)?;
         let session = self.get(id)?;
         let token = self
             .gateway
@@ -806,11 +1078,19 @@ impl DisposableController {
             .iter()
             .find(|g| g.kind == "model" && g.preset_id == session.request.model_id)
             .ok_or_else(|| Error::Invalid("model grant revoked; create a fresh session".into()))?;
-        let ip = std::env::var("DISPOSABLE_GATEWAY_IP").unwrap_or_else(|_| "192.0.2.1".into());
+        let base: std::net::Ipv4Addr = std::env::var("DISPOSABLE_GATEWAY_IP")
+            .unwrap_or_else(|_| "192.0.2.1".into())
+            .parse()
+            .map_err(|_| Error::Invalid("invalid gateway address".into()))?;
+        let ip = std::net::Ipv4Addr::from(
+            u32::from(base)
+                .checked_add(4 * u32::from(session.network_slot))
+                .ok_or_else(|| Error::Invalid("gateway address overflow".into()))?,
+        );
         let port = std::env::var("DISPOSABLE_GATEWAY_PORT").unwrap_or_else(|_| "8123".into());
         let url = format!("http://{ip}:{port}");
         let mcp:Vec<_>=grants.iter().filter(|g|g.kind=="mcp").map(|g|serde_json::json!({"id":g.id,"preset_id":g.preset_id,"url":format!("{url}{}{}",g.gateway_path,g.base_path)})).collect();
-        write_json(&self.dir(id).join("gateway.json"),&serde_json::json!({"url":url,"token":token,"model_id":self.gateway.presets().into_iter().find(|p|p.id==session.request.model_id).and_then(|p|p.model_name).ok_or_else(||Error::Invalid("model preset lacks configured model name".into()))?,"model_path":format!("{}{}",model.gateway_path,model.base_path),"mcp":mcp})).map_err(|e|Error::Internal(e.to_string()))
+        write_json(&self.dir(id).join("gateway.json"),&serde_json::json!({"session_id":id,"grants":grants,"url":url,"token":token,"model_id":self.gateway.presets().into_iter().find(|p|p.id==session.request.model_id).and_then(|p|p.model_name).ok_or_else(||Error::Invalid("model preset lacks configured model name".into()))?,"model_path":format!("{}{}",model.gateway_path,model.base_path),"mcp":mcp})).map_err(|e|Error::Internal(e.to_string()))
     }
     pub async fn refresh_grants(&self, id: &str) -> Result<(), Error> {
         let _operation = self
@@ -848,18 +1128,40 @@ impl DisposableController {
         if s.request.kind != "interactive" || s.state != "running" || s.cancelled {
             return Err(Error::Invalid("interactive session must be running".into()));
         }
-        if prompt.is_empty() || prompt.len() > 65536 {
-            return Err(Error::Invalid("prompt must be 1..65536 bytes".into()));
+        if prompt.is_empty() || prompt.len() > 65520 {
+            return Err(Error::Invalid("prompt must be 1..65520 bytes".into()));
         }
-        write_json(
-            &self.dir(id).join("message.json"),
-            &serde_json::json!({"prompt":prompt}),
-        )
-        .map_err(|e| Error::Internal(e.to_string()))?;
-        self.command("message", &self.dir(id), 20)
-            .await
-            .map_err(Error::Unavailable)?;
-        Ok(())
+        use crate::disposable_console::Control;
+        let console = self.gateway.console();
+        let client_id = format!("message-{}", uuid::Uuid::new_v4());
+        console
+            .control(
+                id,
+                Control::Attach {
+                    client_id: client_id.clone(),
+                },
+            )
+            .map_err(|_| Error::Busy)?;
+        // Paste into the real guest TUI, then submit. Do not retain prompt files on the host.
+        let text = format!("\x1b[200~{prompt}\x1b[201~\r");
+        let result = (|| {
+            for chunk in text.as_bytes().chunks(16 * 1024) {
+                console
+                    .control(
+                        id,
+                        Control::Input {
+                            client_id: client_id.clone(),
+                            hex: hex::encode(chunk),
+                        },
+                    )
+                    .map_err(|_| {
+                        Error::Unavailable("terminal input queue did not accept the prompt".into())
+                    })?;
+            }
+            Ok(())
+        })();
+        let _ = console.control(id, Control::Detach { client_id });
+        result
     }
 }
 fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
@@ -970,7 +1272,8 @@ mod tests {
             state: "cleanup_failed".into(),
             request: r,
             created_at: Utc::now(),
-            deadline: Utc::now(),
+            deadline: Some(Utc::now()),
+            network_slot: 0,
             finished_at: None,
             error: None,
             cancelled: false,
@@ -1012,7 +1315,7 @@ mod tests {
         r
     }
     async fn wait_state(c: &DisposableController, id: &str, expected: &str) {
-        for _ in 0..150 {
+        for _ in 0..300 {
             if c.get(id).unwrap().state == expected {
                 return;
             }
@@ -1036,7 +1339,7 @@ mod tests {
         let session = a.or(b).unwrap();
         c.cancel(&session.id).unwrap();
         wait_state(&c, &session.id, "cancelled").await;
-        assert!(c.dir(&session.id).join("stopped").exists());
+        assert_eq!(fs::read_dir(c.dir(&session.id)).unwrap().count(), 1);
     }
     #[tokio::test]
     async fn failed_cleanup_blocks_next_session() {
@@ -1065,7 +1368,7 @@ mod tests {
             .await
             .unwrap();
         wait_state(&c, &id, "failed").await;
-        assert!(c.dir(&id).join("stopped").exists());
+        assert_eq!(fs::read_dir(c.dir(&id)).unwrap().count(), 1);
     }
     #[tokio::test]
     async fn cancel_interrupts_provisioning_before_cleanup() {
@@ -1084,7 +1387,7 @@ mod tests {
         assert!(c.dir(&s.id).join("provisioning").exists());
         c.cancel(&s.id).unwrap();
         wait_state(&c, &s.id, "cancelled").await;
-        assert!(c.dir(&s.id).join("stopped").exists());
+        assert_eq!(fs::read_dir(c.dir(&s.id)).unwrap().count(), 1);
     }
     #[tokio::test]
     async fn durable_terminal_write_failure_keeps_old_state() {
@@ -1112,7 +1415,8 @@ mod tests {
             state: "running".into(),
             request,
             created_at: Utc::now(),
-            deadline: Utc::now() + Duration::seconds(300),
+            deadline: Some(Utc::now() + Duration::seconds(300)),
+            network_slot: 0,
             finished_at: None,
             error: None,
             cancelled: false,
@@ -1131,6 +1435,149 @@ mod tests {
                 .test_commands,
             vec![vec!["cargo".to_string(), "test".to_string()]]
         );
-        assert!(controller.dir(&id).join("stopped").exists());
+        assert_eq!(fs::read_dir(controller.dir(&id)).unwrap().count(), 1);
+    }
+    fn medium() -> CreateRequest {
+        let mut request = interactive(false);
+        request.memory_mb = 12288;
+        request.vcpus = 4;
+        request.lifetime = "until_deleted".into();
+        request.deadline = None;
+        request.name = Some("Long task".into());
+        request
+    }
+    #[test]
+    fn persistent_lifetime_only_for_interactive_and_exact_presets() {
+        assert_eq!(
+            medium().validated_deadline_for(Utc::now(), false).unwrap(),
+            None
+        );
+        let mut r = request();
+        r.lifetime = "until_deleted".into();
+        assert!(r.validated_deadline_for(Utc::now(), true).is_err());
+        let mut r = medium();
+        r.vcpus = 3;
+        assert!(r.validated_deadline_for(Utc::now(), false).is_err());
+    }
+    #[tokio::test]
+    async fn two_medium_vms_fit_and_delete_purges_work_and_restores_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fixture_script(temp.path(), false, false);
+        let c = DisposableController::open(temp.path().join("state"), script, gateway())
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(c.create(medium()), c.create(medium()));
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_ne!(a.network_slot, b.network_slot);
+        assert_eq!(c.resource_usage().vcpus_used, 8);
+        assert!(!c.can_admit(16384, 6));
+        assert!(matches!(c.create(medium()).await, Err(Error::Busy)));
+        wait_state(&c, &a.id, "running").await;
+        wait_state(&c, &b.id, "running").await;
+        assert!(c.get(&a.id).unwrap().deadline.is_none());
+        fs::create_dir_all(c.dir(&a.id).join("vm")).unwrap();
+        fs::write(c.dir(&a.id).join("vm/disk.qcow2"), b"temporary work").unwrap();
+        fs::write(c.dir(&a.id).join("events.jsonl"), b"private transcript").unwrap();
+        c.cancel(&a.id).unwrap();
+        wait_state(&c, &a.id, "deleted").await;
+        assert_eq!(fs::read_dir(c.dir(&a.id)).unwrap().count(), 1);
+        assert!(c.can_admit(12288, 4));
+        assert!(!c.can_admit(16384, 6));
+        c.cancel(&b.id).unwrap();
+        wait_state(&c, &b.id, "deleted").await;
+        assert!(c.can_admit(16384, 6));
+    }
+    #[tokio::test]
+    async fn confirmed_persistent_vm_restores_gateway_after_management_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fixture_script(temp.path(), false, false);
+        let root = temp.path().join("state");
+        let id = uuid::Uuid::new_v4().to_string();
+        fs::create_dir_all(root.join(&id)).unwrap();
+        let old_gateway = gateway();
+        old_gateway.create_session(&id, None).unwrap();
+        old_gateway.create_grant(&id, "studio", None).unwrap();
+        let token = old_gateway.guest_capability(&id).unwrap();
+        write_json(
+            &root.join(&id).join("gateway-state.json"),
+            &serde_json::json!({"token":token,"grants":old_gateway.list_grants(&id)}),
+        )
+        .unwrap();
+        let session = Session {
+            id: id.clone(),
+            state: "running".into(),
+            request: medium(),
+            created_at: Utc::now(),
+            deadline: None,
+            network_slot: 0,
+            finished_at: None,
+            error: None,
+            cancelled: false,
+        };
+        write_json(&root.join(&id).join("session.json"), &session).unwrap();
+        let c = DisposableController::open(root, script, gateway())
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if c.gateway.guest_capability(&id).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(c.gateway.guest_capability(&id).unwrap(), token);
+        assert_eq!(c.get(&id).unwrap().state, "running");
+        c.cancel(&id).unwrap();
+        wait_state(&c, &id, "deleted").await;
+    }
+    #[tokio::test]
+    async fn persistent_guest_failure_keeps_disk_until_explicit_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fixture_script(temp.path(), false, false);
+        let c = DisposableController::open(temp.path().join("state"), script.clone(), gateway())
+            .await
+            .unwrap();
+        let session = c.create(medium()).await.unwrap();
+        wait_state(&c, &session.id, "running").await;
+        fs::create_dir_all(c.dir(&session.id).join("vm")).unwrap();
+        let disk = c.dir(&session.id).join("vm/disk.qcow2");
+        fs::write(&disk, b"user work").unwrap();
+        fs::write(&script,"#!/bin/sh\ncase \"$1\" in\nstatus) echo '{\"state\":\"failed\"}';;\n*) echo '{}';;\nesac\n").unwrap();
+        wait_state(&c, &session.id, "unavailable").await;
+        assert!(disk.exists());
+        assert_eq!(c.resource_usage().vcpus_used, 4);
+        c.cancel(&session.id).unwrap();
+        wait_state(&c, &session.id, "deleted").await;
+        assert!(!disk.exists());
+    }
+    #[tokio::test]
+    async fn four_small_vms_fit_on_unique_networks_and_one_small_leaves_audit_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = fixture_script(temp.path(), false, false);
+        let c = DisposableController::open(temp.path().join("state"), script, gateway())
+            .await
+            .unwrap();
+        let mut request = medium();
+        request.memory_mb = 8192;
+        request.vcpus = 2;
+        let mut sessions = Vec::new();
+        for index in 0..4 {
+            let session = c.create(request.clone()).await.unwrap();
+            if index == 0 {
+                assert!(c.can_admit(16384, 6));
+            }
+            assert!(!sessions
+                .iter()
+                .any(|old: &Session| old.network_slot == session.network_slot));
+            sessions.push(session);
+        }
+        assert_eq!(c.resource_usage().memory_mb_used, 32768);
+        assert_eq!(c.resource_usage().vcpus_used, 8);
+        assert!(matches!(c.create(request).await, Err(Error::Busy)));
+        for session in sessions {
+            c.cancel(&session.id).unwrap();
+            wait_state(&c, &session.id, "deleted").await;
+        }
+        assert_eq!(c.resource_usage().vcpus_used, 0);
     }
 }

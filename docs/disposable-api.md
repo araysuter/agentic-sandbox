@@ -1,106 +1,122 @@
-# Disposable session API
+# Local VM and audit API behavior
 
-The new profile is opt-in. It shares the existing Rust management server and dashboard, but uses a dedicated KVM runtime and a separate guest-only HTTP gateway. Existing persistent VM/container routes do not participate in this admission gate.
+The dashboard uses the existing Rust management service. All routes below require
+an explicit authenticated **administrator**; a guest capability never authorizes
+management. Existing legacy persistent VM/container routes retain their separate
+behavior. Runtime installation and acceptance are documented in the
+[runtime guide](disposable-runtime.md).
 
-The default VM has **16 GiB RAM and six shared vCPUs**. This version fixes those resources instead of accepting arbitrary VM definitions. OpenCode, Docker and tests run in the guest; TensorFold and model weights remain on the Studio. There are no host filesystem mounts, host Docker sockets or guest GPU devices.
-
-## Host-owned configuration
-
-Set `DISPOSABLE_ENABLED=1`, an absolute `DISPOSABLE_RUNTIME_SCRIPT` pointing to this fork's `scripts/disposable-vm.sh`, `DISPOSABLE_STATE_ROOT`, and `DISPOSABLE_BASE_IMAGE`. The runtime preflight must succeed before an admission is reserved. The prepared base image contains the guest tooling described in the runtime guide; the controller does not install or configure the real host automatically.
-
-The administrator API defaults to loopback when this profile is enabled. The guest plane defaults to `0.0.0.0:8123`, has **only gateway routes**, and uses session capabilities. The isolated VM bridge admits only that port. `DISPOSABLE_GATEWAY_BIND_IP` and `DISPOSABLE_GATEWAY_PORT` configure the listener; `DISPOSABLE_GATEWAY_IP` identifies its address on the isolated bridge (default `192.0.2.1`). Keep the administrative and guest ports different.
-
-`AGENTIC_DISPOSABLE_ENDPOINTS_FILE` identifies an administrator-owned JSON array of endpoint presets. For example (replace both the Studio address and the actual served model alias):
-
-```json
-[
-  {
-    "id": "studio",
-    "kind": "model",
-    "model_name": "your-served-model-alias",
-    "base_url": "http://192.168.1.20:8000/v1",
-    "path_prefixes": ["/v1/chat/completions"],
-    "methods": ["POST"],
-    "allow_private": true,
-    "credential_env": "STUDIO_API_KEY"
-  },
-  {
-    "id": "research-mcp",
-    "kind": "mcp",
-    "base_url": "https://mcp.example.com/mcp",
-    "path_prefixes": ["/mcp"],
-    "methods": ["GET", "POST", "DELETE"],
-    "allow_private": false,
-    "credential_env": "RESEARCH_MCP_KEY"
-  }
-]
-```
-
-`model_id` in a session request selects the preset (`studio`); `model_name` is the exact alias OpenCode sends to TensorFold. Credentials are loaded on the host, injected by the relay, and never serialized into the guest configuration. A granted MCP URL is not a guarantee that its tools are read-only: use appropriate server-side tool and credential scopes.
-
-Weekly audits require a separate administrator-owned `AUDIT_REPOSITORIES_FILE`. Missing configuration denies all audit repositories. Each entry selects permitted workflow refs and guest-only commands as **argv arrays**:
-
-```json
-{
-  "araysuter/TensorFold": {
-    "allowed_refs": ["refs/heads/main"],
-    "audit_profile": {
-      "scanners": ["semgrep", "gitleaks", "trivy"],
-      "test_commands": [["python3", "-m", "pytest", "tests/portable"]],
-      "scope": [],
-      "exclusions": []
-    }
-  }
-}
-```
-
-An omitted scanner list defaults to all three tools. Commands execute only in the guest. The host also checks the submitted repository/ref; the trusted workflow and host runner authenticate the GitHub run context. Do not expose this administrator token to arbitrary workflows or fork pull requests.
-
-## Routes and records
-
-All the following routes start at `/api/v2/disposable-sessions` and require an explicit authenticated **administrator** identity. The legacy behavior that allows unauthenticated administrators when no token file exists is rejected here.
+## Workspaces: `/api/v2/disposable-sessions`
 
 | Method and suffix | Behavior |
 | --- | --- |
-| `GET /` | Enabled status, session records and active admission ID. |
-| `GET /presets` | Sanitized preset metadata, resource defaults and duration limit. |
-| `POST /` | Reserve a session; `202` on admission, `409` immediately when another session owns the gate. |
-| `GET /{id}` | State, deadline, error and profile policy status. |
-| `DELETE /{id}` | Request cancellation; repeated calls are safe. |
-| `PUT /{id}/source` | Upload an uncompressed tar archive for a reserved repository session and begin provisioning. |
-| `GET /{id}/report` | Collected JSON report, retained after VM destruction. |
-| `GET /{id}/output` | Bounded text output with common credential patterns redacted. |
-| `POST /{id}/messages` | Send an interactive prompt, at most 64 KiB, to the guest OpenCode runner. |
-| `GET /{id}/grants` | Current endpoint grants. |
-| `POST /{id}/grants` | Grant a configured endpoint preset until the session deadline or an earlier expiry. |
-| `DELETE /{id}/grants/{grant_id}` | Revoke a grant and terminate its active relay streams. |
+| `GET /` | Session records, active IDs and resource budget/usage. |
+| `GET /presets` | Sanitized model/MCP presets, Small/Medium/Security resource choices and lifetime defaults. |
+| `POST /` | Create a workspace or legacy external audit; `202`, or immediate `409` when capacity cannot fit it. |
+| `GET /{id}` | State, lifetime/deadline, errors and policy status. |
+| `DELETE /{id}` | Destructive workspace deletion or audit cancellation; repeated calls are safe. |
+| `PUT /{id}/source` | Bounded plain-tar upload for an awaiting-source session. |
+| `GET /{id}/terminal` | Authenticated SSE snapshots of the real guest terminal. |
+| `POST /{id}/terminal` | Attach, input, resize, detach or restart the guest terminal process. |
+| `GET /{id}/output` | Bounded legacy text output. |
+| `POST /{id}/messages` | Legacy bounded interactive prompt path. |
+| `GET /{id}/report` | Bounded collected audit JSON after VM teardown. |
+| `GET /{id}/grants` | Session endpoint grants. |
+| `POST /{id}/grants` | Grant a configured preset, optionally expiring earlier than the session. |
+| `DELETE /{id}/grants/{grant_id}` | Revoke access and terminate its active relay streams. |
 
-An interactive request:
-
-```json
-{"kind":"interactive","duration_seconds":3600,"memory_mb":16384,"vcpus":6,"model_id":"studio"}
-```
-
-An audit request includes `repository`, its full 40-character `commit`, `ref_name`, `run_id` and a UTC RFC3339 `deadline`. The host injects `audit_profile`; callers cannot provide arbitrary host runtime commands or profile overrides. Audit admission is restricted to **01:00–06:00 America/Detroit**, including DST, and reserves 300 seconds for collection and cleanup. Delayed jobs cannot acquire another five hours after their scheduled window.
-
-Repository sessions start in `awaiting_source`. The host rejects tar links, special files, absolute/traversing paths, `.git` contents, and archives exceeding 100 MiB transfer or expanded-file limits. This endpoint accepts data, never a path to a host directory. Interactive sessions without a repository start immediately.
-
-Endpoint grant requests have the shape:
+A default Small workspace request:
 
 ```json
-{"preset_id":"research-mcp","expires_at":"2026-10-07T08:00:00Z"}
+{"kind":"interactive","name":"Build workspace","lifetime":"until_deleted","memory_mb":8192,"vcpus":2,"model_id":"studio"}
 ```
 
-Grants work only while a session is running. New MCP configuration reaches interactive OpenCode on its next prompt; revocation takes effect immediately at the relay, including existing streams. Endpoint additions do not restart a currently executing audit.
+Medium accepts `12288` MiB / `4` vCPUs and Security accepts `16384` MiB / `6`
+vCPUs; audits require Security. The global budget is `32768` MiB / `8` vCPUs.
+Four Small workspaces or two Medium workspaces fit. A Small plus an audit fits;
+a Medium plus an audit exceeds CPU capacity. Cleanup failures block admission.
+These are shared vCPUs, not dedicated physical cores or a model-throughput claim.
 
-## Lifecycle and failure behavior
+`until_deleted` is interactive-only and has no deadline. `timed` requires a
+bounded duration up to five hours. The UI confirms destructive deletion; the API
+treats `DELETE` itself as authorization to destroy the workspace. After verified
+containment, interactive disk/workspace/output/credential files are purged; the
+base image and a bounded deletion receipt remain.
 
-Typical states are `awaiting_source → starting → running → collecting → cleaning → completed`. Cancellation ends in `cancelled`; workload failures or deadline-forced partial audits end in `failed`. A `cleanup_failed` record **retains the global admission gate** and retries containment. The gate is released only after runtime destruction succeeds and its terminal state is recorded durably. Issue publishing uses a separate per-repository lock.
+The optional creation field `github_token` enables the built-in GitHub MCP
+preset. HTTP handling removes it before deserializing/persisting session
+metadata, then saves the credential in a separate protected host file. Responses,
+guest environment and OpenCode configuration never contain the PAT. Exa MCP is
+a built-in default grant. Other grants select host-configured exact destinations,
+methods and path scopes; `model_id` selects the preset, whose `model_name` is the
+actual served Studio alias. Upstream credentials are injected on the host.
 
-The host monitors provisioning independently: a cancel or workload cutoff terminates the live runtime process. Its subprocesses use Linux parent-death signals, and cleanup quiesces a matching recorded provisioner through a pidfd before destroying VM/network resources. On management restart, active or partly recorded sessions are destroyed rather than resumed. The runtime additionally arms a host-owned cleanup deadline; guest root cannot extend it. No guest-produced success claim bypasses containment. Deadline-forced reports are marked partial rather than complete.
+Endpoint configuration updates reach the guest, but require restarting the
+OpenCode TUI to take effect. Revocation remains immediate at the host relay.
 
-Repeated audit requests with the same repository, run ID, commit and ref return the existing record. Reusing a run ID for a different commit/ref is rejected. Source uploads occur only while `awaiting_source`.
+The terminal is a guest PTY, not a host shell. SSE uses authenticated fetch so
+operator tokens stay out of URLs. One browser owns input at a time; detach
+releases its lease while guest processes keep running. Reconnection returns the
+bounded output tail and reports truncation when necessary. Restart starts a new
+terminal process within the existing VM. Grant revocation stops new requests and
+closes streams; it cannot retract a request already delivered upstream. An MCP
+transport grant does not restrict what tools that server/token can perform.
 
-Control metadata and collected reports remain under the host state root for retry, debugging and private review; `DELETE` cancels the run rather than erasing that history. Treat reports as sensitive host data. The UI's text redaction is defense in depth, not a promise to recognize every possible secret. Guest model/MCP capabilities expire and are revoked before VM deletion. The issue publisher applies its own report validation, sensitivity policy, deduplication and weekly issue limit.
+## Repository calendar: `/api/v2/local-audits`
 
-`runtime_confirmed` means the configured runtime successfully completed provisioning/preflight checks. It is not a claim that KVM escape resistance, your TensorFold endpoint, or the exact OrcaSAQ conversion has been validated on this Mac. Run the Ubuntu acceptance harness before enabling scheduled audits.
+| Method and suffix | Behavior |
+| --- | --- |
+| `GET /` | Repository events, credential status, next starts, history and audit capacity status. |
+| `POST /` | Save repository, host token and recurring weekly event. |
+| `PUT /{id}` | Replace settings; omitted/blank token preserves its saved credential. |
+| `DELETE /{id}` | Remove future schedule and credential; `409` while its run is active. |
+| `POST /{id}/run` | Run now for the configured event duration, without queuing when busy. |
+| `POST /runs/{id}/cancel` | Cancel a run and its VM. |
+| `GET /runs/{id}/report` | Validated sanitized report, when available. |
+
+Each repository record contains `repository` (`owner/name`), `model_id`,
+`enabled`, `publish_issues`, a weekly `schedule`, and a bounded guest-only
+`audit_profile`. Creation requires `github_token`; update may replace it.
+`schedule` contains `weekday` (Monday=0 to Sunday=6), `start_time`/`end_time`
+(`HH:MM`) and IANA `timezone`. Events are on one day, ten minutes to five hours;
+defaults are 01:00–06:00 America/Detroit. Only GitHub's verified current default
+branch is supported. Test commands are argv arrays run only in the guest.
+
+Credentials are host files mode 0600 inside protected directories mode 0700. API
+responses expose only `credential_configured`. Editing/deleting an active
+repository is blocked; changing settings never silently alters a running VM.
+Repository deletion removes its credential and future events while retaining
+bounded run history. No repository workflow or GitHub Actions runner is involved.
+
+The older external audit HTTP admission retains its separate host repository/ref
+allowlist and overnight policy. The local scheduler uses a crate-private admission
+path with the authenticated saved repository policy and absolute event end;
+external callers cannot supply arbitrary profiles or bypass that policy.
+
+## Lifecycle and retention
+
+Workspace states include `awaiting_source → starting → running → cleaning`, then
+`deleted`, `cancelled` or `failed`. Audits additionally collect reports and expose
+local preparation/publication states. `cleanup_failed` retains containment and
+resource ownership while retrying; successful guest output never releases it.
+
+A running `until_deleted` workspace is recovered after management restart only
+if runtime and saved gateway/capability state verify successfully. If recovery or
+guest tools fail, its disk and capacity remain reserved in `unavailable` state
+until explicit deletion. Timed sessions and interrupted audits are cleaned up, never resumed
+or automatically replayed. A failed/cutoff audit may receive bounded offline
+JSON validation after its deadline; that does not extend VM/model work or permit
+GitHub writes after the deadline.
+
+Metadata history is bounded to 200 terminal records, and collected reports are
+bounded to 2 MiB. Interactive deletion purges its content; retained audit reports
+remain sensitive protected host data until history retention removes them. Raw
+source uploads reject links, special files, traversal, `.git` contents and archives
+exceeding the 100 MiB transfer/expanded bounds. Source is data, never a path to a
+host directory.
+
+`runtime_confirmed` records runtime preflight/provisioning evidence, not proof of
+KVM escape resistance or Studio model compatibility. Portable tests and Mac UI
+previews use fixtures. Unused private SDK dependencies have been removed; the
+full management native type-check passes. Linux compilation and actual
+Ubuntu/Studio acceptance remain separate validation requirements.

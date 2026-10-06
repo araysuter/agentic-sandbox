@@ -1,13 +1,23 @@
+#[path = "../../../management/src/disposable_console.rs"]
+pub mod disposable_console;
 #[path = "../../../management/src/disposable_gateway.rs"]
 pub mod disposable_gateway;
+#[path = "../../../management/src/github_credentials.rs"]
+pub mod github_credentials;
 
 #[path = "../../../management/src/disposable.rs"]
 pub mod disposable;
+
+#[path = "../../../management/src/local_audits.rs"]
+pub mod local_audits;
 
 // Minimal dependency doubles for the HTTP handler seam only. The router and
 // handler implementation below is the production source; full management auth
 // middleware/workspace compilation remains a separate check.
 pub mod http;
+
+#[cfg(test)]
+mod local_audit_http_tests;
 
 #[cfg(test)]
 mod http_contracts {
@@ -23,7 +33,10 @@ mod http_contracts {
     async fn production_router_requires_explicit_admin_and_has_canonical_root() {
         let router = Router::new()
             .nest("/api/v2/disposable-sessions", disposable::router())
-            .with_state(AppState { disposable: None });
+            .with_state(AppState {
+                disposable: None,
+                local_audits: None,
+            });
         let response = router
             .clone()
             .oneshot(
@@ -100,6 +113,95 @@ mod http_lifecycle {
     }
 
     #[tokio::test]
+    async fn interactive_github_token_is_host_only_and_removed_on_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("runtime.sh");
+        std::fs::write(&script,"#!/bin/sh\ncase \"$1\" in\nstatus) echo '{\"state\":\"running\"}';;\n*) echo '{}';;\nesac\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let presets = serde_json::from_value(serde_json::json!([{"id":"studio","kind":"model","model_name":"local","base_url":"http://192.168.1.20:8000/v1","path_prefixes":["/v1"],"methods":["POST"],"allow_private":true}])).unwrap();
+        let c = DisposableController::open(
+            tmp.path().join("state"),
+            script,
+            GatewayStore::new(presets).unwrap(),
+        )
+        .await
+        .unwrap();
+        let app = Router::new()
+            .nest("/api/v2/disposable-sessions", disposable::router())
+            .with_state(AppState {
+                disposable: Some(c.clone()),
+                local_audits: None,
+            })
+            .layer(Extension(OperatorRole::Admin));
+        let secret = "ghp_fixture_only_not_a_real_token";
+        let (code,created)=call(&app,"POST","/api/v2/disposable-sessions",Some(serde_json::json!({"kind":"interactive","lifetime":"until_deleted","memory_mb":12288,"vcpus":4,"github_token":secret}))).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{created}");
+        assert!(!created.to_string().contains(secret));
+        let id = created["id"].as_str().unwrap();
+        let dir = tmp.path().join("state").join(id);
+        for _ in 0..150 {
+            if c.get(id).unwrap().state == "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(c.get(id).unwrap().state, "running");
+        assert!(c
+            .gateway
+            .list_grants(id)
+            .iter()
+            .any(|g| g.preset_id == "exa"));
+        assert!(c
+            .gateway
+            .list_grants(id)
+            .iter()
+            .any(|g| g.preset_id == "github"));
+        assert!(dir.join("github-token.key").exists());
+        for name in [
+            "session.json",
+            "request.json",
+            "gateway.json",
+            "gateway-state.json",
+        ] {
+            assert!(!std::fs::read_to_string(dir.join(name))
+                .unwrap()
+                .contains(secret));
+        }
+        let model = c
+            .gateway
+            .list_grants(id)
+            .into_iter()
+            .find(|g| g.kind == "model")
+            .unwrap();
+        let (code, _) = call(
+            &app,
+            "DELETE",
+            &format!("/api/v2/disposable-sessions/{id}/grants/{}", model.id),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("gateway-state.json")).unwrap())
+                .unwrap();
+        assert!(!ledger["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["id"] == model.id));
+        c.cancel(id).unwrap();
+        for _ in 0..150 {
+            if c.get(id).unwrap().terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(c.get(id).unwrap().state, "deleted");
+        assert!(!dir.join("github-token.key").exists());
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
     async fn actual_http_create_busy_mcp_revoke_prompt_and_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fixture-runtime.sh");
@@ -120,6 +222,7 @@ mod http_lifecycle {
             .nest("/api/v2/disposable-sessions", disposable::router())
             .with_state(AppState {
                 disposable: Some(Arc::clone(&controller)),
+                local_audits: None,
             })
             .layer(Extension(OperatorRole::Admin));
         let root = "/api/v2/disposable-sessions";
@@ -155,7 +258,7 @@ mod http_lifecycle {
             .gateway
             .list_grants(id)
             .iter()
-            .any(|g| g.kind == "mcp"));
+            .any(|g| g.preset_id == "fixture-mcp"));
         assert_eq!(
             call(
                 &app,
@@ -171,7 +274,7 @@ mod http_lifecycle {
             .gateway
             .list_grants(id)
             .iter()
-            .any(|g| g.kind == "mcp"));
+            .any(|g| g.preset_id == "fixture-mcp"));
         assert_eq!(
             call(
                 &app,

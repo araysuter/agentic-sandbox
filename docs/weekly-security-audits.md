@@ -1,52 +1,147 @@
-# Weekly repository audits
+# Repository audits from the UI
 
-Each repository has its own small workflow; no submodule or central scheduling repo is needed. Copy `examples/weekly-security-audit.yml`, replace both SHA placeholders with the same reviewed commit of this fork, and choose a different local weekday for each repo. The reusable workflow checks out **only this pinned harness**, on the trusted Ubuntu host. Audited source is downloaded as data from GitHub at the exact commit and repacked without extracting it on the host. Builds, hooks, scanners, reproductions and Docker run only inside the disposable guest.
+Add a repository to the dashboard, save a fine-grained GitHub personal access
+token on the Ubuntu host, and place a recurring audit event in the weekly
+calendar. The default is **01:00–06:00 America/Detroit**; choose a separate night
+for each repository. The event range is editable, from ten minutes to five hours. GitHub
+Actions, a self-hosted Actions runner and a repository submodule are not part of
+this flow.
 
-The path is:
+## How the pieces work together
 
-```text
-Repo schedule/manual dispatch → dedicated self-hosted runner
-  → host Python adapter → Rust management admission (409 if busy)
-  → fresh 16 GB / 6 vCPU KVM guest → one OpenCode audit agent
-  → host-validated/redacted JSON → repository issues + Actions artifacts
-  → revoke access / destroy guest / release host capacity
-                          ↕ narrow inference gateway
-                    Studio TensorFold API
+```mermaid
+sequenceDiagram
+    participant UI as Weekly calendar
+    participant Host as Ubuntu management service
+    participant GitHub
+    participant VM as Fresh 16 GiB / 6 vCPU VM
+    participant Studio as TensorFold model
+    UI->>Host: Save repo, credential and repeating event
+    Host->>Host: Event due: admit or record busy skip
+    Host->>GitHub: Verify default branch; resolve commit; download archive
+    Host->>VM: Pinned source + guest audit profile
+    VM->>Studio: One OpenCode agent through scoped host relay
+    VM->>VM: Scanners, tests and reproductions with guest Docker
+    VM-->>Host: Bounded findings and coverage report
+    Host->>Host: Revoke access; destroy VM; confirm cleanup
+    Host->>Host: Validate and redact retained findings
+    Host->>GitHub: Optionally create or update validated issues
+    Host-->>UI: Run status, coverage and issue links
 ```
 
-## Scheduling and runner trust
+The service resolves the current default branch when the event runs. It pins
+the resulting commit for source and report provenance. Source is downloaded and
+repacked as bounded data on the host, without extracting it or running repository
+code there. The VM gets a fresh disk, workspace and OpenCode home. TensorFold
+and model weights stay on the Studio; the Ubuntu guest runs OpenCode, Semgrep
+CE, Gitleaks, Trivy, tests and its own Docker daemon.
 
-The two UTC cron entries account for America/Detroit daylight saving time. The adapter compares the triggering cron with the UTC offset at the first local 1 AM of that date, skipping the alternate entry. A delayed correct entry remains eligible until the cutoff; the repeated fall-back 1 AM does not select both entries. Manual runs are allowed only from 1–6 AM. Both adapter and controller enforce the same 6 AM cutoff, with 300 seconds reserved for collection/cleanup; a late run never gets five extra hours. GitHub schedules are best effort, not an exact start guarantee.
+The local worker is `scripts/security-audit/local_audit_worker.py`. Rust owns
+scheduling, admission, deadlines and lifecycle; the worker handles GitHub source
+preparation and validated publication. It reuses the existing report validator
+and publisher rather than treating OpenCode's terminal event stream as a
+findings report.
 
-Provision an explicitly trusted runner carrying `isolated-security-audit`. Restrict runner access and the controller repository allowlist to approved repositories/default branches. Require review of workflow changes and pin reusable workflow/action revisions. A runner label does not authenticate a job. Do not expose this runner to public fork PRs or untrusted workflows: GitHub executes caller workflow YAML on the host before the adapter can reject it. The reusable workflow rejects events other than schedule/manual dispatch and the adapter checks the default branch, but these are additional checks, not a substitute for runner/workflow authorization.
+## Calendar timing and overlap
 
-Host admission coordinates all repositories and dashboard sessions. A busy admission returns 409; the adapter does not retry it, preempt the active run or queue locally. GitHub itself may queue a job when every runner listener is busy. An additional idle trusted listener is needed to obtain prompt busy rejection while another listener is running the audit. Per-repo GitHub concurrency groups do not provide the global capacity lock.
+Each repository has one weekly event, with a selected weekday, IANA timezone and
+same-day start/end time, between ten minutes and five hours. The dashboard
+defaults to America/Detroit 01:00–06:00 and suggests the first unused night when
+adding a repository. You can change it; overlapping events are not queued.
 
-## Host adapter and credentials
+The management service checks due events every 20 seconds. A start can be up to
+60 seconds late; it is not an exact-time alarm. Later missed occurrences are not
+backfilled or queued. The Ubuntu host and management service must remain running
+for scheduled starts. Busy starts are recorded as skipped, without retrying later
+that night. Audits use the shared 32 GiB / eight-vCPU budget. One Small
+workspace (8 GiB / two vCPUs) can coexist with the audit. One Medium workspace
+(12 GiB / four vCPUs) leaves too few CPUs; delete it before the scheduled start.
+Four Small workspaces or two Medium workspaces fit. Overlapping audits are
+still skipped. Cleanup failures block
+admission until verified.
 
-The Python 3.9+ stdlib adapter is `scripts/security-audit/audit_client.py`. It uses the per-job `GITHUB_TOKEN` with `contents: read` and `issues: write`, and a separate `HOST_AUDIT_TOKEN` for the locally bound controller. Neither token enters the guest, source tar, model context or report. `model_id` selects the operator-configured model/grant preset; no actual Studio address or credential is checked into the workflow. Controller URLs are restricted to loopback HTTP. Configure tokens only on the trusted host/Actions secret store; this PR does not provision runners or secrets.
+The event end is the absolute deadline. Delayed preparation reduces the usable
+audit time instead of extending it. The controller reserves 300 seconds for
+collection and cleanup, and the independent host watchdog enforces destruction.
+The gate stays occupied if cleanup fails; successful guest output does not bypass
+that condition.
 
-Adapter contract:
+A repeated daylight-saving wall time uses its first occurrence. Actual elapsed
+time is capped at five hours, so the default fall-back 01:00–06:00 event ends at
+05:00 local time that night. A nonexistent spring-forward start or end is
+skipped. Persisted occurrence markers prevent a weekly event being replayed
+after restart. Active interrupted audits are
+cancelled and recorded as interrupted rather than resumed; inspect any partial
+publication before running again. “Run now” starts at the current time for the
+configured event duration, subject to the same busy rejection and containment.
 
-1. `POST /api/v2/disposable-sessions` with audit identity, pinned commit, trusted default-branch ref, run ID, model preset, 16 GB / 6 vCPUs and absolute deadline; admission reserves capacity.
-2. `PUT /{id}/source` with at most 100 MiB plain tar. The adapter removes GitHub's outer archive directory, rejects links, special files, traversal and duplicate paths, bounds compressed and decompressed bytes, and preserves only ordinary executable bits. It does not extract source locally. Safe guest extraction remains the controller/runtime's responsibility.
-3. Poll `GET /{id}`. `cleanup_failed` is a failed run, never success. Obtain bounded findings from `GET /{id}/report` after completion.
-4. Validate trusted repo/commit, schema, coverage, paths and field sizes; redact common token/private-key patterns. Publish and save selected outputs. Always request idempotent `DELETE /{id}`; the host watchdog remains responsible even if this process disappears.
+## Tokens and repository settings
 
-## Evidence, publication and private review
+Use a fine-grained token limited to the selected repositories, with repository
+contents read and issues write permissions when automatic issue publication is
+enabled. Save it through the authenticated administrator UI. The credential
+is stored on the Ubuntu host in an owner-only file (0600) inside protected
+service storage (0700). API responses expose credential status, never the saved
+token. The token is not copied into the guest, prompts, source archive, process
+arguments or run output.
 
-`findings.schema.json` describes the version-1 report; the executable host validator additionally enforces total bytes, path safety, line ranges, unique fingerprints and trusted identity. OpenCode's event stream is not this report. Scanners and tests contribute evidence; unsupported warnings are not eligible for automatic issues. Completion remains `complete`, `partial` or `failed`, and skipped/failed coverage remains explicit. Partial runs may retain and publish validated findings while Actions records failure.
+The host verifies GitHub's repository identity, default branch and visibility.
+Only the verified default branch is supported in this local flow. Model and
+remote MCP destinations remain host-defined endpoint presets; adding a GitHub
+repository does not grant arbitrary guest internet access or access to the
+Studio's other services.
 
-The publisher creates **zero to five new issues per repository per ISO week**, updates previously tracked fingerprints, and keeps additional findings in the report. It lists all issue pages including closed issues, uses exact repository-qualified fingerprint metadata headers, preserves an issue's original creation-week marker when updating, and reconciles ambiguous create responses before a retry can create another issue. API reads/updates use bounded rate-limit retries. A failed/uncertain creation exits for a later reconciliation rather than blindly repeating POST. A protected host-owned per-repository `flock` serializes publication across runner listeners and retries independently of VM teardown. Competing publication fails busy instead of queueing; the lock directory must be mode 0700 and owned by the runner (`AUDIT_PUBLISHER_STATE_DIR` can select it). Incremental publication checkpoints preserve issue URLs even if a later operation fails.
+Issue publication can be disabled for report-only audits. Pause an event to stop
+future scheduled starts. Editing or deleting repository settings is blocked
+while its run is active; cancel the run and wait for containment first. A running
+VM uses its admitted configuration and absolute deadline. Cancellation cannot
+retract an API request that GitHub has already received.
 
-A finding must include path/lines, impact, concrete evidence, suggested fix and `validated: true`; this schema flag is the guest's assertion, not proof of independent human review. High/critical findings in public repositories default to private review even if the agent omitted the sensitive flag. Sensitive findings are held for operator review on the host rather than published as issues, even for private repos. Token-like content is redacted and automatically classified sensitive. Sensitive titles, paths and exploit details are also withheld from uploaded artifacts; the original bounded report remains in protected controller storage for review. Automated redaction is a defense against accidental copies, not a guarantee that every possible secret representation can be recognized. Configure the audit prompt and grant scopes to keep unnecessary secrets out of model/tool output.
+## Reports and issue publication
 
-The workflow uploads only `report.redacted.json`, `publication.json`, and `summary.md`, with 14-day retention. No raw scanner archives, terminal traces or arbitrary guest paths are uploaded. It never fixes source, pushes commits or opens PRs in an audited repository.
+The host validates the versioned report against the pinned repository, commit
+and source path manifest. Findings need location, impact, concrete evidence,
+suggested fix and a validation flag. The flag is the investigator's assertion,
+not independent human review. Scanner warnings without supporting evidence do
+not become automatic issues. Completion is `complete`, `partial` or `failed`,
+with skipped/failed coverage explicit. A partial report leaves the local run
+marked failed. Validated findings from an otherwise completed VM can still be
+published if enabled. A VM that fails or is cut off does not publish issues;
+its available report is validated offline for private review, including after
+the deadline. This bounded host-only step reads no credential, starts no VM,
+and makes no network requests. Cancellation suppresses publication, and original bounded
+reports can remain in protected controller storage even when no sanitized UI
+report was produced.
 
-## Review checks
+With publication enabled, the publisher creates **zero to five new issues per
+repository per ISO week**, using the run's America/Detroit start date. It updates
+existing fingerprints, including previously closed issues, and retains further
+findings in the report. Pagination, bounded rate-limit retries, per-repository
+publication locks and reconciliation after ambiguous create responses prevent
+blind duplicate POST retries. Partial publication preserves the issue links
+already returned by GitHub.
 
-```sh
-python3 -m unittest discover -s scripts/security-audit -v
-```
+Sensitive findings remain for private host review, even for private repos.
+High/critical findings in public repositories default to private review. The
+publisher rechecks visibility in case the repository became public during a run.
+Common token/private-key patterns are redacted; sensitive titles, paths and
+exploit details are withheld from UI-safe reports. Redaction cannot recognize
+every possible secret representation, so keep unnecessary secrets out of the
+guest and model context.
 
-Portable tests exercise source traversal/link/decompression limits, report identity/path/size rejection, redaction/private review, pagination and closed-issue deduplication, interrupted creation reconciliation, bounded rate-limit retries, the weekly five-issue cap, and DST/cutoff behavior. They use fake GitHub data and create no real issues. Actual KVM/network/Docker isolation and the Studio model require the separate Ubuntu acceptance harness; passing these portable tests does not establish either.
+The staged source archive is removed after transfer or failure. Run files stay
+in protected host storage: pinned source identity, bounded source
+manifest, original report, sanitized report and publication result. No Actions
+artifacts are uploaded. Audits do not fix source, push commits or open PRs in the
+audited repository. The service retains the latest 200 run records and removes
+local artifacts when older terminal records are pruned.
+
+## Validation boundary
+
+Portable scheduler, controller, worker and dashboard tests use fixture services
+and publish no real issues. Actual KVM/network isolation, baseline tooling,
+OpenCode interoperability and the Studio model need the separate
+[Ubuntu acceptance run](disposable-runtime.md). Unused private SDK dependencies
+have been removed and the full management native type-check passes. Linux
+compilation remains an independent requirement. The opt-in installer is in
+`deploy/local-ubuntu`; it does not create repository schedules automatically.

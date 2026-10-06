@@ -36,9 +36,9 @@ try {
     document.querySelector('#disposable-create-form').dispatchEvent(new Event('submit', { cancelable: true })); await settle();
     const created = calls.find((c) => c.path === '/api/v2/disposable-sessions' && c.options.method === 'POST');
     const requestBody = JSON.parse(created.options.body);
-    assert('creation requests 16 GB, 6 shared vCPUs and interactive preset', requestBody.memory_mb === 16384 && requestBody.vcpus === 6 && requestBody.kind === 'interactive' && requestBody.model_id === 'studio-fixture');
+    assert('creation requests Small 8 GiB, 2 vCPUs and interactive preset', requestBody.memory_mb === 8192 && requestBody.vcpus === 2 && requestBody.kind === 'interactive' && requestBody.model_id === 'studio-fixture');
     assert('running state shows confirmed host policy', document.querySelector('#disposable-detail').textContent.includes('runtime_confirmed'));
-    assert('busy ownership disables a competing create', document.querySelector('#disposable-create').disabled);
+    assert('host determines admission for additional workspaces', !document.querySelector('#disposable-create').disabled);
     assert('guest output is rendered as text', document.querySelector('#disposable-output').textContent.includes('<script>') && !window.guestInjected && !document.querySelector('#disposable-output script'));
     document.querySelector('#disposable-grant-preset').value = 'mcp-fixture';
     document.querySelector('#disposable-grant-duration').value = '300';
