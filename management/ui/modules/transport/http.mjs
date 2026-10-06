@@ -160,7 +160,7 @@ export class RequestOwnership {
 }
 
 export class HttpTransport {
-    constructor({ fetchImpl = globalThis.fetch, ownership = new RequestOwnership() } = {}) {
+    constructor({ fetchImpl = (...args) => globalThis.fetch(...args), ownership = new RequestOwnership() } = {}) {
         this.fetchImpl = fetchImpl;
         this.ownership = ownership;
     }

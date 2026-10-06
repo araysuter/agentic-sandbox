@@ -41,6 +41,8 @@ mod config;
 mod crash_loop;
 mod credentials;
 mod dispatch;
+mod disposable;
+mod disposable_gateway;
 mod docker_runtime;
 mod grpc;
 mod grpc_ca_backend;
@@ -980,7 +982,13 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .and_then(|v| v.parse::<std::net::IpAddr>().ok())
-        .unwrap_or_else(|| grpc_addr.ip());
+        .unwrap_or_else(|| {
+            if std::env::var("DISPOSABLE_ENABLED").as_deref() == Ok("1") {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                grpc_addr.ip()
+            }
+        });
     let http_addr: SocketAddr = SocketAddr::new(http_ip, http_port);
     let http_tls_config = http::tls_listener::TlsConfig::from_env(http_addr)?;
     let bootstrap_tls_config = bootstrap_https_config(
@@ -1195,6 +1203,32 @@ async fn main() -> Result<()> {
         });
     }
 
+    // The workload plane has no administrative routes. The isolated bridge's
+    // host firewall admits only this port, and every request needs a scoped
+    // session capability. The admin dashboard defaults to loopback in this mode.
+    let disposable_gateway =
+        disposable_gateway::GatewayStore::from_env().map_err(anyhow::Error::msg)?;
+    let disposable_controller =
+        disposable::DisposableController::from_env(disposable_gateway.clone()).await?;
+    if disposable_controller.is_some() {
+        let ip: std::net::IpAddr = std::env::var("DISPOSABLE_GATEWAY_BIND_IP")
+            .unwrap_or_else(|_| "0.0.0.0".into())
+            .parse()?;
+        let port: u16 = std::env::var("DISPOSABLE_GATEWAY_PORT")
+            .unwrap_or_else(|_| "8123".into())
+            .parse()?;
+        anyhow::ensure!(
+            port != http_addr.port(),
+            "workload and administrative ports must differ"
+        );
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::new(ip, port)).await?;
+        let gateway_router = disposable_gateway::router(disposable_gateway);
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, gateway_router).await {
+                tracing::error!(%error,"disposable workload gateway failed");
+            }
+        });
+    }
     // Start HTTP server in background
     let mcp_config = crate::http::mcp::McpConfig::load(std::path::Path::new(&config.secrets_dir))?;
     let http_server = HttpServer::new(
@@ -1203,6 +1237,7 @@ async fn main() -> Result<()> {
         output_agg.clone(),
         dispatcher.clone(),
     )
+    .with_disposable(disposable_controller)
     .with_orchestrator(orchestrator.clone())
     .with_activity_store(activity_store)
     .with_metrics(telemetry_guard.metrics.clone())

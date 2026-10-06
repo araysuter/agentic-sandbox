@@ -14,6 +14,8 @@ pub mod cert_lifecycle;
 pub mod config;
 pub mod credentials;
 pub mod dispatch;
+pub mod disposable;
+pub mod disposable_gateway;
 pub mod docker_runtime;
 pub mod grpc;
 pub mod grpc_ca_backend;

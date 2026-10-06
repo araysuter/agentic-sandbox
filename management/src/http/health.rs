@@ -146,6 +146,7 @@ mod tests {
         let dispatcher = Arc::new(CommandDispatcher::new(registry.clone()));
 
         AppState {
+            disposable: None,
             registry,
             output_agg,
             dispatcher,

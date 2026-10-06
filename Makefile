@@ -205,6 +205,14 @@ clean: ## Remove build artifacts
 clean-all: clean docker-clean ## Remove all build artifacts and Docker images
 
 # Quick checks before commit
-check: lint test-unit test-scripts test-management-ui ## Run all checks (format check + tests)
+check: lint test-unit test-scripts test-management-ui test-disposable ## Run all checks (format check + tests)
 
 .DEFAULT_GOAL := help
+
+.PHONY: test-disposable
+test-disposable: ## Run portable disposable-session policy, runtime, reporting and UI checks
+	@cargo test --locked --manifest-path tests/disposable-rust/Cargo.toml
+	@python3 -m unittest discover -s scripts/security-audit -v
+	@python3 scripts/test-disposable-runtime.py
+	@bash -n scripts/disposable-vm.sh
+	@node --test --test-concurrency=$(NODE_TEST_CONCURRENCY) management/ui/test/management-ui.test.mjs

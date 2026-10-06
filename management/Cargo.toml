@@ -37,6 +37,8 @@ anyhow = "1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4", "v7"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+tar = "0.4"
 time = "0.3"
 dashmap = "6"  # Concurrent hashmap for agent registry
 parking_lot = "0.12"  # Fast synchronization primitives
@@ -55,7 +57,7 @@ zeroize = "1"
 # HTTP client for Vault — explicit rustls + webpki roots (no native-tls)
 # so we cross-compile cleanly (#311). default-features disabled to drop the
 # implicit default-tls = native-tls.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
 
 # libvirt bindings for VM lifecycle events
 virt = { version = "0.4", optional = true }

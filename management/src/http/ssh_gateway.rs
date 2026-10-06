@@ -238,6 +238,7 @@ mod tests {
     fn test_state() -> AppState {
         let registry = Arc::new(crate::registry::AgentRegistry::new());
         AppState {
+            disposable: None,
             registry: registry.clone(),
             output_agg: Arc::new(crate::output::OutputAggregator::new(64)),
             dispatcher: Arc::new(crate::dispatch::CommandDispatcher::new(registry)),

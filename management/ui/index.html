@@ -24,6 +24,7 @@
             <h1>Agentic Sandbox</h1>
             <nav class="workspace-nav" aria-label="Management workspace">
                 <button type="button" data-workspace="console" class="active">Console</button>
+                <button type="button" data-workspace="disposable">OpenCode VMs</button>
                 <button type="button" data-workspace="fleet">Fleet</button>
                 <button type="button" data-workspace="celld">Celld</button>
                 <button type="button" data-workspace="config">Config</button>
@@ -96,6 +97,63 @@
         </div>
 
         <main id="pane-container">
+            <section id="disposable-workspace" class="management-workspace hidden" aria-labelledby="disposable-title">
+                <header class="workspace-header">
+                    <div><h2 id="disposable-title">Disposable OpenCode VMs</h2><p>One isolated session at a time. Tools run in Ubuntu; inference runs on the Studio.</p></div>
+                    <button id="disposable-refresh" type="button" class="btn">Refresh sessions</button>
+                </header>
+                <form id="disposable-auth-form" class="disposable-auth-form">
+                    <label>Operator bearer token (optional with authenticated mTLS)<input id="disposable-operator-token" type="password" maxlength="4096" autocomplete="off" spellcheck="false"></label>
+                    <button type="submit" class="btn">Connect operator</button>
+                    <button id="disposable-disconnect" type="button" class="btn">Clear operator token</button>
+                    <small>The token stays in this tab's memory until cleared or reloaded. It is never sent to the guest or upstream endpoints.</small>
+                </form>
+                <div id="disposable-status" class="workspace-status" role="status" aria-live="polite">Host readiness has not been checked.</div>
+                <div class="disposable-grid">
+                    <form id="disposable-create-form" class="review-panel">
+                        <h3>Create interactive session</h3>
+                        <p>A fresh workspace and OpenCode home are created in the VM. Host folders and credentials are not mounted.</p>
+                        <label for="disposable-model">Host model preset</label><select id="disposable-model" required disabled><option value="">Loading presets…</option></select>
+                        <div class="disposable-fields">
+                            <label>Memory (GB)<input id="disposable-memory" type="number" min="16" max="16" step="1" value="16" readonly required></label>
+                            <label>Shared vCPUs<input id="disposable-cpus" type="number" min="6" max="6" value="6" readonly required></label>
+                            <label>Duration (minutes)<input id="disposable-duration" type="number" min="1" max="300" value="60" required></label>
+                        </div>
+                        <label>Repository (optional, owner/name)<input id="disposable-repository" maxlength="201" placeholder="owner/repo"></label>
+                        <label>Pinned commit (required with repository)<input id="disposable-commit" maxlength="40" placeholder="40-character Git commit SHA" spellcheck="false"></label>
+                        <label>Prepared repository snapshot (uncompressed .tar, at most 100 MiB)<input id="disposable-source-file" type="file" accept=".tar,application/x-tar"></label>
+                        <p id="disposable-source-help">For a repository session, provide the exact commit and its prepared data-only tar snapshot. The host validates archive paths before transfer; repository code runs only in the guest. Leave these fields empty for a fresh /workspace. Scheduled audits use the per-repo workflow.</p>
+                        <button id="disposable-create" type="submit" class="btn btn-primary" disabled>Create disposable VM</button>
+                        <p>Admission fails when another interactive session or audit owns the model. Ownership lasts through collection and cleanup.</p>
+                    </form>
+                    <section class="review-panel" aria-labelledby="disposable-sessions-title"><h3 id="disposable-sessions-title">Sessions</h3><div id="disposable-list" class="workspace-list"><p>No session inventory loaded.</p></div></section>
+                    <section class="review-panel disposable-wide" aria-labelledby="disposable-detail-title">
+                        <h3 id="disposable-detail-title">Session state and permissions</h3>
+                        <div id="disposable-detail" class="workspace-detail"><p>Select a session.</p></div>
+                        <div class="workspace-actions">
+                            <button id="disposable-cancel" type="button" class="btn" disabled>Cancel and clean up</button>
+                            <button id="disposable-delete" type="button" class="btn" disabled>Delete / retry cleanup</button>
+                            <button id="disposable-upload-source" type="button" class="btn" disabled>Upload selected snapshot / retry staging</button>
+                        </div>
+                        <p>Deleting stops the VM and removes writable storage. Cleanup failures stay visible and continue to block admission.</p>
+                        <div id="disposable-grants" class="workspace-detail"><p>No session selected.</p></div>
+                        <form id="disposable-grant-form" class="disposable-grant-form">
+                            <label>Temporary endpoint preset<select id="disposable-grant-preset" required disabled><option value="">No presets loaded</option></select></label>
+                            <label>Expiry from now (minutes)<input id="disposable-grant-duration" type="number" min="1" max="300" value="60" required></label>
+                            <button id="disposable-add-grant" type="submit" class="btn" disabled>Grant endpoint access</button>
+                        </form>
+                        <p>Presets define exact destinations, paths and methods on the host. MCP URL permissions do not restrict which tools the server exposes. Revocation stops new requests and active streams; it cannot retract previously delivered data.</p>
+                        <details><summary>Host enforcement evidence</summary><pre id="disposable-policy">No evidence loaded.</pre></details>
+                        <form id="disposable-message-form">
+                            <label>OpenCode prompt<textarea id="disposable-prompt" rows="4" maxlength="65536" placeholder="Inspect this workspace or run tools inside the VM." required></textarea></label>
+                            <button id="disposable-send-message" type="submit" class="btn" disabled>Run OpenCode prompt</button>
+                        </form>
+                        <details><summary>OpenCode event output</summary><pre id="disposable-output">No selected output.</pre></details>
+                        <details><summary>Audit report and coverage</summary><pre id="disposable-report">No audit report selected.</pre></details>
+                    </section>
+                </div>
+            </section>
+
             <section id="fleet-workspace" class="management-workspace hidden" aria-labelledby="fleet-workspace-title">
                 <header class="workspace-header">
                     <div><h2 id="fleet-workspace-title">Fleet workloads</h2><p>Durable desired, observed, and correlated workload state.</p></div>

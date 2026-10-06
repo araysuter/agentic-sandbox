@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agentic-sandbox:security-findings:1",
+  "title": "Security audit findings v1 (host validator enforces identity and total byte bounds)",
+  "type": "object",
+  "required": ["version", "repository", "commit", "completion", "coverage", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "completion": {"enum": ["complete", "partial", "failed"]},
+    "coverage": {
+      "type": "object", "required": ["scanned_paths", "scanners", "tests", "skipped"], "additionalProperties": false,
+      "properties": {
+        "scanned_paths": {"type": "array", "maxItems": 2000, "items": {"type": "string", "maxLength": 1024}},
+        "scanners": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/tool"}},
+        "tests": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/tool"}},
+        "skipped": {"type": "array", "maxItems": 200, "items": {"type": "string", "maxLength": 4096}}
+      }
+    },
+    "findings": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/finding"}}
+  },
+  "$defs": {
+    "tool": {
+      "type": "object", "required": ["name", "status", "detail"], "additionalProperties": false,
+      "properties": {"name": {"type": "string", "maxLength": 256}, "status": {"enum": ["passed", "failed", "skipped"]}, "detail": {"type": "string", "maxLength": 4096}}
+    },
+    "finding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fingerprint", "title", "path", "line_start", "line_end", "category", "severity", "impact", "evidence", "suggested_fix", "validated", "sensitive"],
+      "properties": {
+        "fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 256},
+        "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "line_start": {"type": "integer", "minimum": 1, "maximum": 10000000},
+        "line_end": {"type": "integer", "minimum": 1, "maximum": 10000000},
+        "category": {"type": "string", "minLength": 1, "maxLength": 256},
+        "severity": {"enum": ["critical", "high", "medium", "low"]},
+        "impact": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "evidence": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "suggested_fix": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "validated": {"type": "boolean"}, "sensitive": {"type": "boolean"}
+      }
+    }
+  }
+}

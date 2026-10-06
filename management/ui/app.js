@@ -4330,12 +4330,18 @@ class AgenticDashboard {
             'ssh-lease-instance', 'ssh-lease-principal', 'ssh-lease-mode',
             'ssh-lease-public-key', 'ssh-lease-ttl',
         ]) document.getElementById(id)?.addEventListener('input', () => this.discardSshLeaseReview(false));
+        this.disposableWorkspace = new window.ManagementUI.DisposableWorkspace({
+            root: document, request: (path, options) => this.managementRequest(path, options),
+        });
         const requested = new URLSearchParams(window.location.search).get('workspace');
-        if (['fleet', 'celld', 'config', 'access'].includes(requested)) this.switchManagementWorkspace(requested);
+        if (['fleet', 'celld', 'config', 'access', 'disposable'].includes(requested)) this.switchManagementWorkspace(requested);
     }
 
     switchManagementWorkspace(workspace = 'console') {
-        const selected = ['fleet', 'celld', 'config', 'access'].includes(workspace) ? workspace : 'console';
+        const selected = ['fleet', 'celld', 'config', 'access', 'disposable'].includes(workspace) ? workspace : 'console';
+        document.body.classList.toggle('workspace-disposable', selected === 'disposable');
+        document.getElementById('disposable-workspace')?.classList.toggle('hidden', selected !== 'disposable');
+        this.disposableWorkspace?.setActive(selected === 'disposable');
         document.body.classList.toggle('workspace-fleet', selected === 'fleet');
         document.body.classList.toggle('workspace-celld', selected === 'celld');
         document.body.classList.toggle('workspace-config', selected === 'config');

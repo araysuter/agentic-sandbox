@@ -69,6 +69,15 @@ credential and release-provenance claims intentionally qualified by evidence.
 
 ---
 
+## Disposable OpenCode and weekly audits
+
+The fork adds a disposable OpenCode session flow for a local model on a separate
+Studio, with 16 GiB / six shared vCPU KVM guests, temporary endpoint grants and
+per-repository weekly audit workflows. See [how the components work together](docs/disposable-sessions.md),
+[weekly audit integration](docs/weekly-security-audits.md), and
+[Ubuntu runtime acceptance](docs/disposable-runtime.md). The new profile requires
+explicit host configuration and KVM acceptance before operational use.
+
 ## Part of the AIWG Suite
 
 [![Part of the AIWG ecosystem](https://aiwg.io/assets/badges/aiwg-wordmark-dark.png)](https://aiwg.io)

@@ -1,0 +1,25 @@
+apiVersion: loadout/v1
+kind: loadout
+metadata:
+  name: opencode-disposable
+  description: Disposable OpenCode harness; Studio inference is mediated outside the guest
+  labels:
+    category: task-focused
+    isolation: disposable-kvm
+extends:
+  - layers/base-dev.yaml
+  - providers/opencode.yaml
+resources:
+  cpus: 6
+  memory: 16G
+  disk: 80G
+  gpu:
+    enabled: false
+network:
+  mode: isolated
+ai_tools:
+  opencode:
+    enabled: true
+# This descriptor documents the prepared baseline. Use scripts/disposable-vm.sh
+# for this profile: ordinary provision-vm.sh does not implement its firewall,
+# no-share, disposable-disk or credential boundary.

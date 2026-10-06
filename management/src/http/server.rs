@@ -115,6 +115,7 @@ struct Assets;
 /// Shared state for HTTP handlers
 #[derive(Clone)]
 pub struct AppState {
+    pub disposable: Option<Arc<crate::disposable::DisposableController>>,
     pub registry: Arc<AgentRegistry>,
     pub output_agg: Arc<OutputAggregator>,
     pub dispatcher: Arc<CommandDispatcher>,
@@ -212,6 +213,7 @@ impl AppState {
         dispatcher: Arc<CommandDispatcher>,
     ) -> Self {
         Self {
+            disposable: None,
             registry,
             output_agg,
             dispatcher,
@@ -279,6 +281,15 @@ impl HttpServer {
             bootstrap_tls: None,
             executor_surface: None,
         }
+    }
+
+    /// Enable the separately admitted disposable KVM profile.
+    pub fn with_disposable(
+        mut self,
+        controller: Option<Arc<crate::disposable::DisposableController>>,
+    ) -> Self {
+        self.state.disposable = controller;
+        self
     }
 
     /// Mount the v2 executor router under `/agents/*` (#243). When unset
@@ -519,6 +530,7 @@ impl HttpServer {
             .route("/api/v1/health", get(health_handler_v1))
             .route("/api/v1/health/ready", get(readiness_handler))
             .route("/api/v1/health/live", get(liveness_handler))
+            .nest("/api/v2/disposable-sessions", super::disposable::router())
             .nest("/api/v2/credentials", credentials::router())
             .nest("/api/v2/credential-proxy", credential_proxy::router())
             .nest("/api/v2/startup-profiles", startup_profile_router)

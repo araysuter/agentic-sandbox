@@ -15,6 +15,7 @@ pub mod containers;
 pub mod credential_proxy;
 pub mod credentials;
 pub mod dispatch;
+pub mod disposable;
 pub mod events;
 pub mod fleet;
 pub mod health;

@@ -6909,6 +6909,7 @@ mod tests {
         use std::sync::Arc;
         let registry = Arc::new(AgentRegistry::new());
         AppState {
+            disposable: None,
             registry: registry.clone(),
             output_agg: Arc::new(OutputAggregator::new(64)),
             dispatcher: Arc::new(CommandDispatcher::new(registry)),

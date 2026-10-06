@@ -8,3 +8,5 @@ export * from './domains/admin.mjs';
 export * from './domains/access.mjs';
 export * from './views/status.mjs';
 export * from './views/operations.mjs';
+export * from './domains/disposable.mjs';
+export * from './views/disposable.mjs';
